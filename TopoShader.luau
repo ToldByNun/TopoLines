@@ -5,6 +5,8 @@
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local AssetService     = game:GetService("AssetService")
+local GuiService       = game:GetService("GuiService")
+local Lighting         = game:GetService("Lighting")
 
 local TopoShader = {}
 TopoShader.__index = TopoShader
@@ -94,10 +96,30 @@ local DEFAULTS = {
 	vignetteStrength   = 0.10,       -- subtle edge darkening
 	parallelEnabled    = false,      -- requires Actor setup in hierarchy
 	parallelWorkers    = 4,          -- desired worker count
+	parallelChunkRows  = 32,         -- rows per worker chunk
 
 	-- ── Misc ─────────────────────────────────────────────────
 	fps          = 60,
 	cornerRadius = 16,
+	panelTransparency = 0.0, -- 0 = opaque panel, 1 = fully transparent
+	imageTransparency = 0.0, -- applies to shader image itself
+	outputOpacity = 1.0, -- multiplies per-pixel alpha (0..1)
+	localBlurEnabled = true, -- prefers per-panel UIBlurEffect when available
+	localBlurSize = 10, -- per-panel blur strength
+	backgroundBlurEnabled = false, -- uses Lighting.BlurEffect (global blur)
+	backgroundBlurSize = 10, -- 0-56 typical
+	fakeLocalBackdropEnabled = false, -- ViewportFrame "cheese" local blur backdrop
+	fakeLocalBackdropAlpha = 0.35, -- 0..1 visibility of backdrop layer
+	fakeLocalBackdropRefreshHz = 15, -- lower = cheaper
+	fakeLocalBackdropQuality = "balanced", -- low | balanced | high
+	fakeLocalBackdropMaxParts = 350, -- cap cloned parts for backdrop
+	fakeLocalBackdropDistance = 180, -- studs from camera to include
+	fakeLocalBackdropRebuildSec = 2.5, -- periodic rescan for moving camera/scenes
+	fakeLocalBackdropSimplify = true, -- simplify materials/colors for blur-like look
+	fakeLocalBackdropPanelOnly = true, -- include only parts visible behind panel area
+	fakeLocalBackdropPanelMargin = 48, -- pixel margin around panel bounds
+	fakeLocalBackdropBlurStrength = 0.65, -- 0..1 stronger frosted blur simulation
+	topoModeAppliesTheme = true, -- make topo mode switches visibly distinct
 }
 
 -- Beginner-safe config schema. Values are clamped/sanitized on write.
@@ -108,6 +130,7 @@ local CONFIG_RULES = {
 	contourLevels = { t = "number", min = 2, max = 64, integer = true },
 	lineWidth = { t = "number", min = 0.02, max = 0.25 },
 	lineSharpness = { t = "number", min = 0.7, max = 1.4 },
+	topoMode = { t = "enum", values = { classic = true, godRays = true, precision = true, bold = true, dream = true } },
 	octaves = { t = "number", min = 1, max = 8, integer = true },
 	lacunarity = { t = "number", min = 1.2, max = 3.5 },
 	persistence = { t = "number", min = 0.1, max = 0.95 },
@@ -121,7 +144,11 @@ local CONFIG_RULES = {
 	mouseRadius = { t = "number", min = 0, max = 600 },
 	mouseStrength = { t = "number", min = 0, max = 3.0 },
 	mouseEnabled = { t = "boolean" },
+	bgColor = { t = "color4" },
+	lineColor = { t = "color4" },
 	elevationTint = { t = "boolean" },
+	colorLow = { t = "color3" },
+	colorHigh = { t = "color3" },
 	tintAmount = { t = "number", min = 0, max = 1 },
 	glowEnabled = { t = "boolean" },
 	glowStrength = { t = "number", min = 0, max = 1 },
@@ -146,9 +173,29 @@ local CONFIG_RULES = {
 	vignetteStrength = { t = "number", min = 0, max = 0.5 },
 	parallelEnabled = { t = "boolean" },
 	parallelWorkers = { t = "number", min = 1, max = 16, integer = true },
+	parallelChunkRows = { t = "number", min = 8, max = 128, integer = true },
 	fps = { t = "number", min = 1, max = 240, integer = true },
 	cornerRadius = { t = "number", min = 0, max = 80, integer = true },
 	theme = { t = "enum", values = { classic = true, ocean = true, neon = true, paper = true } },
+	panelTransparency = { t = "number", min = 0, max = 1 },
+	imageTransparency = { t = "number", min = 0, max = 1 },
+	outputOpacity = { t = "number", min = 0, max = 1 },
+	localBlurEnabled = { t = "boolean" },
+	localBlurSize = { t = "number", min = 0, max = 56, integer = true },
+	backgroundBlurEnabled = { t = "boolean" },
+	backgroundBlurSize = { t = "number", min = 0, max = 56, integer = true },
+	fakeLocalBackdropEnabled = { t = "boolean" },
+	fakeLocalBackdropAlpha = { t = "number", min = 0, max = 1 },
+	fakeLocalBackdropRefreshHz = { t = "number", min = 1, max = 60, integer = true },
+	fakeLocalBackdropQuality = { t = "enum", values = { low = true, balanced = true, high = true } },
+	fakeLocalBackdropMaxParts = { t = "number", min = 50, max = 3000, integer = true },
+	fakeLocalBackdropDistance = { t = "number", min = 30, max = 1024 },
+	fakeLocalBackdropRebuildSec = { t = "number", min = 0.2, max = 10 },
+	fakeLocalBackdropSimplify = { t = "boolean" },
+	fakeLocalBackdropPanelOnly = { t = "boolean" },
+	fakeLocalBackdropPanelMargin = { t = "number", min = 0, max = 256, integer = true },
+	fakeLocalBackdropBlurStrength = { t = "number", min = 0, max = 1 },
+	topoModeAppliesTheme = { t = "boolean" },
 }
 
 local THEMES = {
@@ -192,6 +239,57 @@ local THEMES = {
 		glowEnabled = false,
 		glowStrength = 0.0,
 	},
+}
+
+local TOPO_MODES = {
+	classic = {
+		lineWidth = 0.08, lineSharpness = 1.0, contourLevels = 12,
+		lineAAMode = "fast", lineAAStrength = 2.0, edgeAAEnabled = false,
+		bgColor = { r=0.016, g=0.016, b=0.022, a=1 },
+		lineColor = { r=1.00, g=1.00, b=1.00, a=1 },
+		elevationTint = true, colorLow = { r=0.12, g=0.28, b=0.68 }, colorHigh = { r=0.80, g=0.93, b=1.00 }, tintAmount = 0.45,
+	},
+	godRays = {
+		lineWidth = 0.10, lineSharpness = 0.92, contourLevels = 10,
+		lineAAMode = "msaa4", lineAAStrength = 2.8, edgeAAEnabled = true,
+		edgeAAQuality = "hq", edgeAAStrength = 0.58, glowEnabled = true, glowStrength = 0.12,
+		bgColor = { r=0.03, g=0.01, b=0.05, a=1 },
+		lineColor = { r=1.00, g=0.96, b=0.82, a=1 },
+		elevationTint = true, colorLow = { r=0.95, g=0.46, b=0.08 }, colorHigh = { r=1.00, g=0.92, b=0.40 }, tintAmount = 0.62,
+	},
+	precision = {
+		lineWidth = 0.065, lineSharpness = 1.08, contourLevels = 16,
+		lineAAMode = "msaa4", lineAAStrength = 2.2, edgeAAEnabled = true,
+		edgeAAQuality = "hq", edgeAAStrength = 0.45, glowEnabled = false,
+		bgColor = { r=0.01, g=0.02, b=0.03, a=1 },
+		lineColor = { r=0.88, g=0.98, b=1.00, a=1 },
+		elevationTint = true, colorLow = { r=0.20, g=0.60, b=1.00 }, colorHigh = { r=0.90, g=1.00, b=1.00 }, tintAmount = 0.35,
+	},
+	bold = {
+		lineWidth = 0.12, lineSharpness = 0.88, contourLevels = 9,
+		lineAAMode = "fast", lineAAStrength = 1.6, edgeAAEnabled = false,
+		glowEnabled = false,
+		bgColor = { r=0.00, g=0.00, b=0.00, a=1 },
+		lineColor = { r=1.00, g=1.00, b=1.00, a=1 },
+		elevationTint = false, tintAmount = 0.0,
+	},
+	dream = {
+		lineWidth = 0.095, lineSharpness = 0.9, contourLevels = 11,
+		lineAAMode = "msaa4", lineAAStrength = 2.6, edgeAAEnabled = true,
+		edgeAAQuality = "hq", edgeAAStrength = 0.62, glowEnabled = true, glowStrength = 0.10,
+		animSpeed = 0.012,
+		bgColor = { r=0.02, g=0.01, b=0.05, a=1 },
+		lineColor = { r=0.96, g=0.93, b=1.00, a=1 },
+		elevationTint = true, colorLow = { r=0.56, g=0.18, b=0.98 }, colorHigh = { r=0.50, g=0.98, b=0.94 }, tintAmount = 0.70,
+	},
+}
+
+local TOPO_MODE_THEME = {
+	classic = "classic",
+	godRays = "neon",
+	precision = "ocean",
+	bold = "paper",
+	dream = "neon",
 }
 
 -- ================================================================
@@ -246,6 +344,24 @@ local function sanitizeValue(key, value)
 		if rule.min ~= nil then n = _max(rule.min, n) end
 		if rule.max ~= nil then n = _min(rule.max, n) end
 		return n
+	end
+	if rule.t == "color3" then
+		if type(value) ~= "table" then return nil end
+		local r = tonumber(value.r)
+		local g = tonumber(value.g)
+		local b = tonumber(value.b)
+		if not r or not g or not b then return nil end
+		return { r = saturate(r), g = saturate(g), b = saturate(b) }
+	end
+	if rule.t == "color4" then
+		if type(value) ~= "table" then return nil end
+		local r = tonumber(value.r)
+		local g = tonumber(value.g)
+		local b = tonumber(value.b)
+		local a = tonumber(value.a)
+		if not r or not g or not b then return nil end
+		if not a then a = 1 end
+		return { r = saturate(r), g = saturate(g), b = saturate(b), a = saturate(a) }
 	end
 	return value
 end
@@ -364,6 +480,7 @@ function TopoShader.new(parentGui, userConfig)
 	end
 	self.cfg = cfg
 	self:SetQualityPreset(cfg.qualityPreset or "balanced")
+	self:ApplyFakeBackdropQuality(cfg.fakeLocalBackdropQuality or "balanced")
 
 	-- Internal state
 	self._running   = false
@@ -398,9 +515,20 @@ function TopoShader.new(parentGui, userConfig)
 		lastIssues = "",
 		parallelReady = false,
 		parallelWorkers = 0,
+		localBlurReady = false,
+		fakeBackdropReady = false,
 	}
 	self._parallelReady = false
 	self._parallelWorkers = 0
+	self._localBlurReady = false
+	self._parallelActors = {}
+	self._parallelConns = {}
+	self._parallelJobId = 0
+	self._parallelInFlight = false
+	self._parallelPending = 0
+	self._parallelFrameReady = false
+	self._parallelFrameTime = 0
+	self._autoTune = nil
 
 	-- Pre-bake noise-space XY per pixel
 	-- This is the critical fix: frequency must be low
@@ -475,12 +603,15 @@ function TopoShader.new(parentGui, userConfig)
 	clip.Size                   = UDim2.fromOffset(cfg.width, cfg.height)
 	clip.Position               = UDim2.fromScale(0.5, 0.5)
 	clip.BackgroundColor3       = Color3.new(0, 0, 0)
-	clip.BackgroundTransparency = 0
+	clip.BackgroundTransparency = cfg.panelTransparency or 0
 	clip.BorderSizePixel        = 0
 	clip.ClipsDescendants       = true
 	clip.ZIndex                 = 1
 	clip.Parent                 = root
 	self._clip = clip
+	self._blur = nil
+	self._uiBlur = nil
+	self:_syncBackgroundBlur()
 
 	do
 		local uc = Instance.new("UICorner")
@@ -495,9 +626,37 @@ function TopoShader.new(parentGui, userConfig)
 	img.BackgroundTransparency = 1
 	img.BorderSizePixel        = 0
 	img.ScaleType              = Enum.ScaleType.Stretch
+	img.ImageTransparency      = cfg.imageTransparency or 0
 	img.ZIndex                 = 2
 	img.Parent                 = clip
 	self._img = img
+
+	-- Optional localized backdrop "cheese blur" layer (ViewportFrame)
+	local vpf = Instance.new("ViewportFrame")
+	vpf.Name = "LocalBackdrop"
+	vpf.Size = UDim2.fromScale(1, 1)
+	vpf.BackgroundTransparency = 1
+	vpf.BorderSizePixel = 0
+	vpf.ImageTransparency = 1 - (cfg.fakeLocalBackdropAlpha or 0.35)
+	vpf.ZIndex = 1
+	vpf.Visible = cfg.fakeLocalBackdropEnabled and true or false
+	vpf.Parent = clip
+	self._vpf = vpf
+
+	local wm = Instance.new("WorldModel")
+	wm.Name = "BackdropWorld"
+	wm.Parent = vpf
+	self._vpfWorld = wm
+
+	local vcam = Instance.new("Camera")
+	vcam.Name = "BackdropCamera"
+	vcam.Parent = vpf
+	vpf.CurrentCamera = vcam
+	self._vpfCamera = vcam
+	self._vpfMap = {}
+	self._vpfAccum = 0
+	self._vpfRebuildAccum = 0
+	self._vpfReady = false
 
 	-- EditableImage via AssetService
 	local ok, ei = pcall(function()
@@ -736,6 +895,24 @@ end
 --  RENDER FRAME
 -- ================================================================
 function TopoShader:_render(t)
+	if self._parallelReady and self.cfg.parallelEnabled then
+		local renderStart = os.clock()
+		if not self._parallelInFlight then
+			self:_dispatchParallelFrame(t)
+		end
+		if self._parallelFrameReady then
+			if self.cfg.edgeAAEnabled and (self._frameId % _max(1, self.cfg.edgeAAInterval or 1) == 0) then
+				self:_applyEdgeAA()
+			end
+			self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), self._buf)
+			self._parallelFrameReady = false
+			self._frameId += 1
+		end
+		local renderMs = (os.clock() - renderStart) * 1000
+		self:_updateDebug(renderMs)
+		return
+	end
+
 	local renderStart = os.clock()
 	local cfg      = self.cfg
 	local rW       = self._rW
@@ -785,6 +962,7 @@ function TopoShader:_render(t)
 	local temporalKeep  = 1 - temporalBlend
 	local checkerboard  = cfg.checkerboardReconstruction
 	local phase         = self._checkerPhase
+	local outputOpacity = cfg.outputOpacity or 1.0
 	local vignetteEnabled = cfg.vignetteEnabled
 	local vignetteStrength = cfg.vignetteStrength or 0
 	local lineAAEnabled = cfg.lineAAEnabled
@@ -848,6 +1026,7 @@ function TopoShader:_render(t)
 			h = heightField(nx, ny, zSlice, oct, lac, per, warp)
 		end
 
+		local r, g, b, a
 		-- Contour detection  →  0 = gap,  1 = line centre
 		local bandPos = (h * levels) % 1.0
 		local d = _min(bandPos, 1 - bandPos)
@@ -894,17 +1073,10 @@ function TopoShader:_render(t)
 			lineV = lineV ^ lineSharpness
 		end
 
-		-- Compute final color
-		local r, g, b, a
-
 		if lineV < 0.004 then
-			-- Background pixel — skip lerp
 			r, g, b, a = bgR, bgG, bgB, bgA
 		else
-			-- Line pixel: start with white
 			r, g, b = lnR, lnG, lnB
-
-			-- Optionally tint by elevation
 			if doTint then
 				local tr = loR + (hiR - loR) * h
 				local tg = loG + (hiG - loG) * h
@@ -913,8 +1085,6 @@ function TopoShader:_render(t)
 				g = g * invTint + tg * tintAmt
 				b = b * invTint + tb * tintAmt
 			end
-
-			-- Anti-alias: blend line over background using lineV
 			r = lerp(bgR, r, lineV)
 			g = lerp(bgG, g, lineV)
 			b = lerp(bgB, b, lineV)
@@ -925,7 +1095,7 @@ function TopoShader:_render(t)
 		local ur = _floor(saturate(r) * 255 + 0.5)
 		local ug = _floor(saturate(g) * 255 + 0.5)
 		local ub = _floor(saturate(b) * 255 + 0.5)
-		local ua = _floor(saturate(a) * 255 + 0.5)
+		local ua = _floor(saturate(a * outputOpacity) * 255 + 0.5)
 		if temporalBlend > 0 then
 			ur = _floor(ur * temporalKeep + buffer.readu8(hist, idx) * temporalBlend + 0.5)
 			ug = _floor(ug * temporalKeep + buffer.readu8(hist, idx + 1) * temporalBlend + 0.5)
@@ -1014,18 +1184,23 @@ function TopoShader:Start()
 	self._running = true
 	self:_refreshParallelState()
 
-	-- Track mouse position in panel-local space
+	-- Track mouse position in panel-local space (with GUI inset correction)
 	self._inputConn = UserInputService.InputChanged:Connect(function(inp)
 		if inp.UserInputType == Enum.UserInputType.MouseMovement then
-			local mp  = UserInputService:GetMouseLocation()
+			local mp = UserInputService:GetMouseLocation()
+			local insetTL = GuiService:GetGuiInset()
 			local abs = self._clip.AbsolutePosition
-			self._mouseX = mp.X - abs.X
-			self._mouseY = mp.Y - abs.Y
+			local size = self._clip.AbsoluteSize
+			local localX = mp.X - insetTL.X - abs.X
+			local localY = mp.Y - insetTL.Y - abs.Y
+			self._mouseX = _max(0, _min(size.X, localX))
+			self._mouseY = _max(0, _min(size.Y, localY))
 		end
 	end)
 
 	local inv = 1 / self.cfg.fps
 	self._conn = RunService.RenderStepped:Connect(function(dt)
+		self:_syncLocalBackdrop(dt)
 		self._debugClock += dt
 		if dt > 0 then
 			self._debugReport.fps = 1 / dt
@@ -1056,6 +1231,12 @@ function TopoShader:SetConfig(key, value)
 	if key == "debugEnabled" and self._debugLabel then
 		self._debugLabel.Visible = self.cfg.debugEnabled and true or false
 	end
+	if key == "panelTransparency" and self._clip then
+		self._clip.BackgroundTransparency = self.cfg.panelTransparency or 0
+	end
+	if key == "imageTransparency" and self._img then
+		self._img.ImageTransparency = self.cfg.imageTransparency or 0
+	end
 
 	-- Rebuild coord cache if spatial frequency changed
 	if key == "baseFrequency" then
@@ -1084,6 +1265,29 @@ function TopoShader:SetConfig(key, value)
 	end
 	if key == "visualProfile" then
 		self:SetVisualProfile(self.cfg.visualProfile)
+	end
+	if key == "backgroundBlurEnabled" or key == "backgroundBlurSize" then
+		self:_syncBackgroundBlur()
+	end
+	if key == "localBlurEnabled" or key == "localBlurSize" then
+		self:_syncBackgroundBlur()
+	end
+	if key == "fakeLocalBackdropEnabled" or key == "fakeLocalBackdropAlpha" then
+		if self._vpf then
+			self._vpf.Visible = self.cfg.fakeLocalBackdropEnabled and true or false
+			self._vpf.ImageTransparency = 1 - (self.cfg.fakeLocalBackdropAlpha or 0.35)
+		end
+		if self.cfg.fakeLocalBackdropEnabled and not self._vpfReady then
+			self:_rebuildLocalBackdrop()
+		end
+	end
+	if key == "fakeLocalBackdropQuality" then
+		self:ApplyFakeBackdropQuality(self.cfg.fakeLocalBackdropQuality)
+	end
+	if key == "fakeLocalBackdropDistance" or key == "fakeLocalBackdropMaxParts" or key == "fakeLocalBackdropSimplify" then
+		if self.cfg.fakeLocalBackdropEnabled then
+			self:_rebuildLocalBackdrop()
+		end
 	end
 	return true
 end
@@ -1216,6 +1420,11 @@ function TopoShader:ApplyTheme(name)
 end
 
 function TopoShader:_refreshParallelState()
+	for _, c in ipairs(self._parallelConns) do
+		c:Disconnect()
+	end
+	self._parallelConns = {}
+	self._parallelActors = {}
 	self._parallelReady = false
 	self._parallelWorkers = 0
 
@@ -1241,12 +1450,26 @@ function TopoShader:_refreshParallelState()
 			local dn = child:FindFirstChild("RenderDone")
 			if not (rq and rq:IsA("BindableEvent") and dn and dn:IsA("BindableEvent")) then
 				protocolReady = false
+			else
+				table.insert(self._parallelActors, {
+					actor = child,
+					request = rq,
+					done = dn,
+				})
 			end
 		end
 	end
 
 	self._parallelWorkers = workers
 	self._parallelReady = protocolReady and workers >= _max(1, self.cfg.parallelWorkers or 1)
+	if self._parallelReady then
+		for _, w in ipairs(self._parallelActors) do
+			local conn = w.done.Event:Connect(function(result)
+				self:_onParallelChunkDone(result)
+			end)
+			table.insert(self._parallelConns, conn)
+		end
+	end
 	self._debugReport.parallelReady = self._parallelReady
 	self._debugReport.parallelWorkers = workers
 end
@@ -1254,6 +1477,384 @@ end
 function TopoShader:SetParallelEnabled(enabled)
 	self.cfg.parallelEnabled = enabled and true or false
 	self:_refreshParallelState()
+end
+
+function TopoShader:_syncBackgroundBlur()
+	-- Try local panel blur first (if class is supported by client/runtime).
+	self._localBlurReady = false
+	if self.cfg.localBlurEnabled and self._clip then
+		if not self._uiBlur then
+			local ok, inst = pcall(function()
+				return Instance.new("UIBlurEffect")
+			end)
+			if ok and inst then
+				inst.Name = "TopoPanelBlur"
+				inst.Size = self.cfg.localBlurSize or 10
+				inst.Parent = self._clip
+				self._uiBlur = inst
+				self._localBlurReady = true
+			end
+		else
+			self._uiBlur.Size = self.cfg.localBlurSize or 10
+			if self._uiBlur.Parent ~= self._clip then
+				self._uiBlur.Parent = self._clip
+			end
+			self._localBlurReady = true
+		end
+	else
+		if self._uiBlur then
+			self._uiBlur:Destroy()
+			self._uiBlur = nil
+		end
+	end
+	self._debugReport.localBlurReady = self._localBlurReady
+
+	-- Optional global blur fallback/stack.
+	if self.cfg.backgroundBlurEnabled then
+		if not self._blur then
+			local blur = Instance.new("BlurEffect")
+			blur.Name = "TopoShaderBlur"
+			blur.Size = self.cfg.backgroundBlurSize or 10
+			blur.Parent = Lighting
+			self._blur = blur
+		else
+			self._blur.Size = self.cfg.backgroundBlurSize or 10
+			if not self._blur.Parent then
+				self._blur.Parent = Lighting
+			end
+		end
+	else
+		if self._blur then
+			self._blur:Destroy()
+			self._blur = nil
+		end
+	end
+end
+
+function TopoShader:_rebuildLocalBackdrop()
+	if not (self._vpf and self._vpfWorld) then return end
+	self._vpfMap = {}
+	self._vpfWorld:ClearAllChildren()
+
+	local cam = workspace.CurrentCamera
+	if not cam then
+		self._vpfReady = false
+		self._debugReport.fakeBackdropReady = false
+		return
+	end
+	local camPos = cam and cam.CFrame.Position
+	local maxDist = self.cfg.fakeLocalBackdropDistance or 180
+	local maxDistSq = maxDist * maxDist
+	local cap = _max(1, self.cfg.fakeLocalBackdropMaxParts or 350)
+	local simplify = self.cfg.fakeLocalBackdropSimplify
+	local panelOnly = self.cfg.fakeLocalBackdropPanelOnly
+	local panelMargin = self.cfg.fakeLocalBackdropPanelMargin or 48
+	local inset = GuiService:GetGuiInset()
+	local abs = self._clip and self._clip.AbsolutePosition or Vector2.zero
+	local size = self._clip and self._clip.AbsoluteSize or Vector2.zero
+
+	local function inPanelThreshold(worldPos)
+		if not panelOnly then return true end
+		local vp, onScreen = cam:WorldToViewportPoint(worldPos)
+		if not onScreen then return false end
+		local sx = vp.X - inset.X
+		local sy = vp.Y - inset.Y
+		local minX = abs.X - panelMargin
+		local minY = abs.Y - panelMargin
+		local maxX = abs.X + size.X + panelMargin
+		local maxY = abs.Y + size.Y + panelMargin
+		return sx >= minX and sx <= maxX and sy >= minY and sy <= maxY
+	end
+
+	local count = 0
+	for _, inst in ipairs(workspace:GetDescendants()) do
+		if inst:IsA("BasePart") and not inst:IsDescendantOf(self._root) then
+			if camPos then
+				local dp = inst.Position - camPos
+				local dSq = dp.X * dp.X + dp.Y * dp.Y + dp.Z * dp.Z
+				if dSq > maxDistSq then
+					continue
+				end
+			end
+			if not inPanelThreshold(inst.Position) then
+				continue
+			end
+			local ok, clone = pcall(function()
+				return inst:Clone()
+			end)
+			if ok and clone then
+				clone.Anchored = true
+				clone.CanCollide = false
+				if simplify then
+					clone.Material = Enum.Material.SmoothPlastic
+					local gray = (clone.Color.R + clone.Color.G + clone.Color.B) / 3
+					clone.Color = Color3.new(gray, gray, gray):Lerp(Color3.fromRGB(110, 125, 145), 0.35)
+					clone.Reflectance = 0
+				end
+				clone.Parent = self._vpfWorld
+				self._vpfMap[inst] = clone
+				count += 1
+				if count >= cap then
+					break
+				end
+			end
+		end
+	end
+	self._vpfReady = count > 0
+	self._debugReport.fakeBackdropReady = self._vpfReady
+end
+
+function TopoShader:_syncLocalBackdrop(dt)
+	if not self.cfg.fakeLocalBackdropEnabled then
+		if self._vpf then self._vpf.Visible = false end
+		self._debugReport.fakeBackdropReady = false
+		return
+	end
+	if not self._vpf or not self._vpfCamera then return end
+
+	self._vpf.Visible = true
+	self._vpf.ImageTransparency = 1 - (self.cfg.fakeLocalBackdropAlpha or 0.35)
+	local blurS = self.cfg.fakeLocalBackdropBlurStrength or 0.65
+	self._vpf.ImageColor3 = Color3.fromRGB(255, 255, 255):Lerp(Color3.fromRGB(155, 170, 190), blurS * 0.55)
+
+	self._vpfRebuildAccum += dt
+	if self._vpfRebuildAccum >= (self.cfg.fakeLocalBackdropRebuildSec or 2.5) then
+		self._vpfRebuildAccum = 0
+		self:_rebuildLocalBackdrop()
+	end
+
+	if not self._vpfReady then
+		self:_rebuildLocalBackdrop()
+		if not self._vpfReady then
+			self._vpf.Visible = false
+			return
+		end
+	end
+
+	local hz = _max(1, self.cfg.fakeLocalBackdropRefreshHz or 15)
+	local interval = 1 / hz
+	self._vpfAccum += dt
+	if self._vpfAccum < interval then
+		return
+	end
+	self._vpfAccum = 0
+
+	local cam = workspace.CurrentCamera
+	if cam then
+		self._vpfCamera.CFrame = cam.CFrame
+		self._vpfCamera.FieldOfView = cam.FieldOfView
+		self._vpf.Visible = true
+	end
+
+	for src, dst in pairs(self._vpfMap) do
+		if src and src.Parent and dst then
+			dst.CFrame = src.CFrame
+			local sizeBoost = 1 + blurS * 0.025
+			dst.Size = src.Size * sizeBoost
+			if self.cfg.fakeLocalBackdropSimplify then
+				local gray = (src.Color.R + src.Color.G + src.Color.B) / 3
+				dst.Color = Color3.new(gray, gray, gray):Lerp(Color3.fromRGB(115, 130, 150), 0.45 + blurS * 0.2)
+				dst.Material = Enum.Material.SmoothPlastic
+			else
+				dst.Color = src.Color
+				dst.Material = src.Material
+			end
+			dst.Transparency = _min(1, src.Transparency + 0.12 + blurS * 0.45)
+			if dst:IsA("MeshPart") and src:IsA("MeshPart") then
+				dst.TextureID = src.TextureID
+			end
+		else
+			self._vpfMap[src] = nil
+		end
+	end
+end
+
+function TopoShader:_onParallelChunkDone(result)
+	if type(result) ~= "table" then return end
+	if result.jobId ~= self._parallelJobId then return end
+	local data = result.data
+	local rowStart = result.rowStart
+	local rowEnd = result.rowEnd
+	if not data or rowStart == nil or rowEnd == nil then return end
+
+	local rW = self._rW
+	local rows = rowEnd - rowStart + 1
+	local dstStart = rowStart * rW * 4
+	local count = rows * rW * 4
+	for i = 0, count - 1 do
+		buffer.writeu8(self._buf, dstStart + i, buffer.readu8(data, i))
+	end
+
+	self._parallelPending -= 1
+	if self._parallelPending <= 0 then
+		self._parallelInFlight = false
+		self._parallelFrameReady = true
+	end
+end
+
+function TopoShader:_dispatchParallelFrame(t)
+	if not self._parallelReady then return false end
+	if self._parallelInFlight then return false end
+
+	local rH = self._rH
+	local chunkRows = _max(8, self.cfg.parallelChunkRows or 32)
+	local workers = self._parallelActors
+	if #workers == 0 then return false end
+
+	self._parallelJobId += 1
+	self._parallelFrameTime = t
+	self._parallelPending = 0
+	self._parallelInFlight = true
+
+	local row = 0
+	local wi = 1
+	while row < rH do
+		local rowStart = row
+		local rowEnd = _min(rH - 1, row + chunkRows - 1)
+		local w = workers[wi]
+		self._parallelPending += 1
+		w.request:Fire({
+			jobId = self._parallelJobId,
+			rowStart = rowStart,
+			rowEnd = rowEnd,
+			rW = self._rW,
+			rH = self._rH,
+			time = t,
+			baseFrequency = self.cfg.baseFrequency,
+			contourLevels = self.cfg.contourLevels,
+			lineWidth = self.cfg.lineWidth,
+			bgColor = self.cfg.bgColor,
+			lineColor = self.cfg.lineColor,
+			elevationTint = self.cfg.elevationTint,
+			colorLow = self.cfg.colorLow,
+			colorHigh = self.cfg.colorHigh,
+			tintAmount = self.cfg.tintAmount,
+			animSpeed = self.cfg.animSpeed,
+			animAngle = self.cfg.animAngle,
+			lacunarity = self.cfg.lacunarity,
+			persistence = self.cfg.persistence,
+			warpAmount = self.cfg.warpAmount,
+			fastMode = self.cfg.fastMode,
+			ultraFastMode = self.cfg.ultraFastMode,
+			octaves = self.cfg.octaves,
+		})
+		row = rowEnd + 1
+		wi += 1
+		if wi > #workers then wi = 1 end
+	end
+
+	return true
+end
+
+function TopoShader:GetTopoModes()
+	return { "classic", "godRays", "precision", "bold", "dream" }
+end
+
+function TopoShader:ApplyFakeBackdropQuality(profile)
+	if profile == "low" then
+		self:SetConfig("fakeLocalBackdropRefreshHz", 8)
+		self:SetConfig("fakeLocalBackdropMaxParts", 180)
+		self:SetConfig("fakeLocalBackdropDistance", 120)
+		self:SetConfig("fakeLocalBackdropAlpha", 0.22)
+		self:SetConfig("fakeLocalBackdropRebuildSec", 3.0)
+		self:SetConfig("fakeLocalBackdropSimplify", true)
+		self:SetConfig("fakeLocalBackdropPanelMargin", 36)
+		self:SetConfig("fakeLocalBackdropBlurStrength", 0.45)
+	elseif profile == "high" then
+		self:SetConfig("fakeLocalBackdropRefreshHz", 20)
+		self:SetConfig("fakeLocalBackdropMaxParts", 700)
+		self:SetConfig("fakeLocalBackdropDistance", 260)
+		self:SetConfig("fakeLocalBackdropAlpha", 0.38)
+		self:SetConfig("fakeLocalBackdropRebuildSec", 1.2)
+		self:SetConfig("fakeLocalBackdropSimplify", false)
+		self:SetConfig("fakeLocalBackdropPanelMargin", 72)
+		self:SetConfig("fakeLocalBackdropBlurStrength", 0.82)
+	else -- balanced
+		self:SetConfig("fakeLocalBackdropRefreshHz", 12)
+		self:SetConfig("fakeLocalBackdropMaxParts", 350)
+		self:SetConfig("fakeLocalBackdropDistance", 180)
+		self:SetConfig("fakeLocalBackdropAlpha", 0.30)
+		self:SetConfig("fakeLocalBackdropRebuildSec", 2.5)
+		self:SetConfig("fakeLocalBackdropSimplify", true)
+		self:SetConfig("fakeLocalBackdropPanelMargin", 48)
+		self:SetConfig("fakeLocalBackdropBlurStrength", 0.65)
+	end
+	self.cfg.fakeLocalBackdropQuality = profile
+	if self.cfg.fakeLocalBackdropEnabled then
+		self:_rebuildLocalBackdrop()
+	end
+end
+
+function TopoShader:BeginAutoTune()
+	local candidates = {
+		{ name = "ultra_perf", cfg = { renderWidth = 184, renderHeight = 120, qualityPreset = "performance", lineAAMode = "off", edgeAAEnabled = false } },
+		{ name = "perf_clean", cfg = { renderWidth = 220, renderHeight = 140, qualityPreset = "performance", lineAAMode = "fast", edgeAAEnabled = false } },
+		{ name = "balanced", cfg = { renderWidth = 240, renderHeight = 156, qualityPreset = "balanced", lineAAMode = "fast", edgeAAEnabled = false } },
+		{ name = "balanced_plus", cfg = { renderWidth = 260, renderHeight = 170, qualityPreset = "balanced", lineAAMode = "fast", edgeAAEnabled = true, edgeAAInterval = 2 } },
+	}
+	self._autoTune = {
+		candidates = candidates,
+		i = 1,
+		frameCount = 0,
+		accMs = 0,
+		best = nil,
+		bestScore = -1e9,
+		targetMs = 16.6,
+		done = false,
+	}
+	self:Configure(candidates[1].cfg)
+	return true
+end
+
+function TopoShader:_stepAutoTune(renderMs)
+	local a = self._autoTune
+	if not a or a.done then return end
+	a.frameCount += 1
+	a.accMs += renderMs
+	if a.frameCount < 30 then
+		return
+	end
+
+	local avg = a.accMs / a.frameCount
+	local c = a.candidates[a.i]
+	local qualityBonus = a.i * 1.75
+	local score = (avg <= a.targetMs and 1000 or 0) + qualityBonus - avg
+	if score > a.bestScore then
+		a.bestScore = score
+		a.best = c
+	end
+
+	a.i += 1
+	if a.i > #a.candidates then
+		if a.best then
+			self:Configure(a.best.cfg)
+		end
+		a.done = true
+		self._autoTune = nil
+		return
+	end
+
+	a.frameCount = 0
+	a.accMs = 0
+	self:Configure(a.candidates[a.i].cfg)
+end
+
+function TopoShader:ApplyTopoMode(mode)
+	local preset = TOPO_MODES[mode]
+	if not preset then
+		return false, "Unknown topo mode: " .. tostring(mode)
+	end
+	if self.cfg.topoModeAppliesTheme then
+		local themeName = TOPO_MODE_THEME[mode]
+		if themeName then
+			self:ApplyTheme(themeName)
+		end
+	end
+	for k, v in pairs(preset) do
+		self:SetConfig(k, v)
+	end
+	self.cfg.topoMode = mode
+	return true
 end
 
 function TopoShader:_updateAdaptiveQuality(renderMs)
@@ -1312,6 +1913,11 @@ function TopoShader:GetDebugReport()
 		parallelEnabled = self.cfg.parallelEnabled,
 		parallelReady = d.parallelReady,
 		parallelWorkers = d.parallelWorkers,
+		localBlurEnabled = self.cfg.localBlurEnabled,
+		localBlurReady = d.localBlurReady,
+		backgroundBlurEnabled = self.cfg.backgroundBlurEnabled,
+		fakeLocalBackdropEnabled = self.cfg.fakeLocalBackdropEnabled,
+		fakeBackdropReady = d.fakeBackdropReady,
 		lastIssues = d.lastIssues,
 	}
 end
@@ -1352,21 +1958,43 @@ function TopoShader:_updateDebug(renderMs)
 	if self.cfg.parallelEnabled and not self._parallelReady then
 		table.insert(issues, "parallel_not_ready")
 	end
+	if self.cfg.localBlurEnabled and not self._localBlurReady then
+		table.insert(issues, "local_blur_unavailable")
+	end
+	if self.cfg.fakeLocalBackdropEnabled and not self._vpfReady then
+		table.insert(issues, "fake_backdrop_unavailable")
+	end
+	if self.cfg.fakeLocalBackdropEnabled and self._vpfReady and (self.cfg.fakeLocalBackdropMaxParts or 0) <= 120 then
+		table.insert(issues, "fake_backdrop_low_detail")
+	end
 	d.lastIssues = (#issues > 0) and table.concat(issues, ",") or "ok"
 
 	if self.cfg.debugEnabled and self._debugLabel and self._debugClock >= (self.cfg.debugUpdateRate or 0.25) then
 		self._debugClock = 0
 		self._debugLabel.Text = string.format(
-			"FPS: %.1f | Render: %.2fms (avg %.2f / max %.2f)\nPreset: %s | Adaptive: %s | Over budget: %d\nIssues: %s",
+			"FPS: %.1f | Render: %.2fms (avg %.2f / max %.2f)\nPreset: %s | Adaptive: %s | Over budget: %d\nBlur local/global: %s/%s | Issues: %s",
 			d.fps, d.lastRenderMs, d.renderMsAvg, d.renderMsMax,
 			tostring(self.cfg.qualityPreset), tostring(self.cfg.adaptiveQuality),
-			d.overBudgetFrames, d.lastIssues
+			d.overBudgetFrames, tostring(self._localBlurReady), tostring(self.cfg.backgroundBlurEnabled), d.lastIssues
 		)
 	end
+	self:_stepAutoTune(renderMs)
 end
 
 function TopoShader:Destroy()
 	self:Stop()
+	if self._uiBlur then
+		self._uiBlur:Destroy()
+		self._uiBlur = nil
+	end
+	if self._blur then
+		self._blur:Destroy()
+		self._blur = nil
+	end
+	if self._vpf then
+		self._vpf:Destroy()
+		self._vpf = nil
+	end
 	self._root:Destroy()
 end
 

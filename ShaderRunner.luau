@@ -9,9 +9,9 @@ local shader = TopoShader.new(script.Parent, {
 	width        = 460,
 	height       = 300,
 
-	-- Render internally at half size — bilinear stretch = free smoothing
-	renderWidth  = 220,
-	renderHeight = 140,
+	-- Low-cost base resolution (for stable 60fps)
+	renderWidth  = 184,
+	renderHeight = 120,
 
 	-- ── The critical number: LOW frequency = smooth hills ──────
 	-- (renderWidth × baseFrequency) should be ~1.5 to 3.0
@@ -19,8 +19,8 @@ local shader = TopoShader.new(script.Parent, {
 	baseFrequency = 0.008,
 
 	-- Contours
-	contourLevels = 12,
-	lineWidth     = 0.075,
+	contourLevels = 10,
+	lineWidth     = 0.115,
 
 	-- Noise character
 	octaves     = 4,
@@ -28,31 +28,32 @@ local shader = TopoShader.new(script.Parent, {
 	persistence = 0.52,
 	warpAmount  = 1.0,
 	fastMode    = true,
-	ultraFastMode = false,
+	ultraFastMode = true,
 	checkerboardReconstruction = false,
-	temporalBlend = 0.08,
+	temporalBlend = 0.12,
 	edgeAAEnabled   = false,
-	edgeAAStrength  = 0.52,
-	edgeAAThreshold = 14,
-	edgeAAInterval  = 2,
+	edgeAAStrength  = 0.42,
+	edgeAAThreshold = 16,
+	edgeAAInterval  = 3,
 	edgeAAQuality   = "hq",
-	lineAAEnabled   = true,
-	lineAAStrength  = 2.0,
+	lineAAEnabled   = false,
+	lineAAStrength  = 1.8,
 	lineAAStep      = 0.55,
-	lineAAMode      = "msaa4",
-	lineAASubpixel  = 0.35,
+	lineAAMode      = "off",
+	lineAASubpixel  = 0.30,
 	qualityPreset   = "balanced",
-	adaptiveQuality = true,
-	frameBudgetMs   = 12.0,
+	adaptiveQuality = false,
+	frameBudgetMs   = 16.6,
 	debugEnabled    = true,
 	debugUpdateRate = 0.25,
-	visualProfile   = "balanced",
+	visualProfile   = "performance",
 	vignetteEnabled = true,
 	vignetteStrength = 0.10,
-	lineSharpness   = 1.0,
+	lineSharpness   = 0.88,
 	parallelEnabled = false,
 	parallelWorkers = 4,
 	theme = "classic",
+	topoMode = "classic",
 
 	-- Slow drift
 	animSpeed = 0.018,
@@ -61,7 +62,7 @@ local shader = TopoShader.new(script.Parent, {
 	-- Mouse bends contours
 	mouseRadius   = 120,
 	mouseStrength = 0.35,
-	mouseEnabled  = true,
+	mouseEnabled  = false,
 
 	-- Dark navy bg, white lines, blue-to-white elevation tint
 	bgColor   = { r=0.016, g=0.016, b=0.022, a=1 },
@@ -73,21 +74,60 @@ local shader = TopoShader.new(script.Parent, {
 	tintAmount    = 0.45,
 
 	glowEnabled  = false,
-	glowStrength = 0.20,
+	glowStrength = 0.08,
 
 	fps          = 60,
 	cornerRadius = 16,
+	panelTransparency = 1.0,
+	imageTransparency = 0.18,
+	outputOpacity = 0.82,
+	localBlurEnabled = true,
+	localBlurSize = 24,
+	backgroundBlurEnabled = false,
+	backgroundBlurSize = 10,
+	fakeLocalBackdropEnabled = true,
+	fakeLocalBackdropAlpha = 0.28,
+	fakeLocalBackdropRefreshHz = 12,
+	fakeLocalBackdropQuality = "balanced",
+	fakeLocalBackdropMaxParts = 350,
+	fakeLocalBackdropDistance = 180,
+	fakeLocalBackdropRebuildSec = 2.5,
+	fakeLocalBackdropSimplify = true,
+	fakeLocalBackdropPanelOnly = true,
+	fakeLocalBackdropPanelMargin = 48,
+	fakeLocalBackdropBlurStrength = 0.72,
+	topoModeAppliesTheme = true,
 })
 
 shader:SetPosition(UDim2.fromScale(0.5, 0.5))
 shader:SetAnchor(Vector2.new(0.5, 0.5))
 shader:ApplyTheme("classic")
+shader:SetQualityPreset("performance")
+shader:SetVisualProfile("performance")
+shader:ApplyTopoMode("bold")
+shader:Configure({
+	adaptiveQuality = false,
+	lineAAMode = "off",
+	edgeAAEnabled = false,
+	edgeAAQuality = "hq",
+	mouseEnabled = false,
+})
 shader:Start()
 
 -- Hotkeys
 local UIS = game:GetService("UserInputService")
 local themes = shader:GetThemeNames()
+local topoModes = shader:GetTopoModes()
+local backdropQualities = { "low", "balanced", "high" }
 local themeIdx = 1
+local topoIdx = 1
+local backdropIdx = 2
+for i, m in ipairs(topoModes) do
+	if m == shader.cfg.topoMode then
+		topoIdx = i
+		break
+	end
+end
 local function keyName(inp)
 	return inp.KeyCode and inp.KeyCode.Name or ""
 end
@@ -155,6 +195,11 @@ UIS.InputBegan:Connect(function(inp, gp)
 		shader:SetParallelEnabled(not shader.cfg.parallelEnabled)
 		print("[TopoShader] parallelEnabled =", shader.cfg.parallelEnabled)
 	end
+	-- F6 = auto tune best settings for hardware
+	if k == "F6" then
+		shader:BeginAutoTune()
+		print("[TopoShader] auto-tune started (about 120 frames)")
+	end
 	-- M = toggle mouse interaction
 	if k == "M" then
 		shader:SetMouseEnabled(not shader.cfg.mouseEnabled)
@@ -204,9 +249,25 @@ UIS.InputBegan:Connect(function(inp, gp)
 		shader:ApplyTheme(themeName)
 		print("[TopoShader] theme =", themeName)
 	end
+	-- Y = cycle fake local backdrop quality
+	if k == "Y" then
+		backdropIdx += 1
+		if backdropIdx > #backdropQualities then backdropIdx = 1 end
+		local q = backdropQualities[backdropIdx]
+		shader:ApplyFakeBackdropQuality(q)
+		print("[TopoShader] fakeBackdropQuality =", q)
+	end
+	-- G = cycle topo modes
+	if k == "G" or k == "R" then
+		topoIdx += 1
+		if topoIdx > #topoModes then topoIdx = 1 end
+		local m = topoModes[topoIdx]
+		shader:ApplyTopoMode(m)
+		print("[TopoShader] topoMode =", m, "theme =", shader.cfg.theme)
+	end
 	-- H = print keybind help
 	if k == "H" then
-		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 7/8/9 visuals | T theme | M mouse | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | N edgeAA quality | K adaptive toggle | 0 adaptive on | F8 overlay | F9 report | F10 parallel")
+		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 7/8/9 visuals | T theme | G topo mode | Y fake backdrop quality | M mouse | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | N edgeAA quality | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel")
 	end
 	-- J = print schema/template helpers for customization
 	if k == "J" then

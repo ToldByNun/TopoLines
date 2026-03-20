@@ -52,10 +52,12 @@ shader:Configure({
 - `SetMouseInteraction(radius, strength, enabledOptional)`
 - `ApplyTheme(name)`
 - `GetThemeNames()`
+- `ApplyFakeBackdropQuality("low" | "balanced" | "high")`
 - `SetDebugEnabled(boolean)`
 - `GetDebugReport()`
 - `FormatDebugReport()`
 - `SetParallelEnabled(boolean)`
+- `BeginAutoTune()` (tests candidates and applies best profile for your hardware)
 
 ## Presets vs Profiles
 
@@ -204,6 +206,26 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
   - **What**: target shader update rate (not engine FPS).
 - `parallelEnabled`, `parallelWorkers`
   - **What**: Actor mode controls.
+- `fakeLocalBackdropEnabled`
+  - **What**: enables ViewportFrame-based local backdrop blur workaround (panel-only).
+- `fakeLocalBackdropQuality`
+  - `low`: fastest, fewer parts, softer/less accurate.
+  - `balanced`: recommended default.
+  - `high`: best local backdrop quality, highest cost.
+- `fakeLocalBackdropAlpha`
+  - **What**: visibility of the local backdrop layer.
+- `fakeLocalBackdropRefreshHz`
+  - **What**: backdrop sync refresh rate. Lower = cheaper.
+- `fakeLocalBackdropMaxParts`
+  - **What**: cap on cloned parts for local backdrop.
+- `fakeLocalBackdropDistance`
+  - **What**: only parts near camera are cloned/synced.
+- `fakeLocalBackdropRebuildSec`
+  - **What**: how often the part set is rescanned.
+- `fakeLocalBackdropSimplify`
+  - **What**: simplifies materials/colors for blur-like appearance and lower cost.
+- `fakeLocalBackdropBlurStrength`
+  - **What**: strength of the frosted blur simulation (desaturation + transparency + edge bleed).
 
 ### Debug
 
@@ -268,6 +290,28 @@ shader:Configure({
 })
 ```
 
+### Local Backdrop Blur (UI-only workaround)
+
+```lua
+shader:Configure({
+    fakeLocalBackdropEnabled = true,
+    fakeLocalBackdropQuality = "balanced",
+    fakeLocalBackdropAlpha = 0.30,
+})
+```
+
+For weaker devices:
+
+```lua
+shader:ApplyFakeBackdropQuality("low")
+```
+
+For showcase captures:
+
+```lua
+shader:ApplyFakeBackdropQuality("high")
+```
+
 ## Keybinds in `ShaderRunner.luau`
 
 - `P`: pause/resume
@@ -275,6 +319,7 @@ shader:Configure({
 - `1 / 2 / 3`: quality preset (locks adaptive off)
 - `7 / 8 / 9`: visual profile
 - `T`: cycle theme
+- `Y`: cycle fake local backdrop quality (`low/balanced/high`)
 - `M`: mouse on/off
 - `; / '`: mouse strength down/up (`- / =` aliases included)
 - `, / .`: mouse radius down/up
@@ -287,6 +332,7 @@ shader:Configure({
 - `F8`: debug overlay
 - `F9`: print debug report
 - `F10`: parallel mode toggle
+- `F6`: auto-tune best settings
 - `H`: key help
 - `J`: config schema/template help
 
