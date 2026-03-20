@@ -56,6 +56,11 @@ local DEFAULTS = {
 	mouseRadius   = 120,   -- pixels (panel space)
 	mouseStrength = 0.35,  -- noise-space push magnitude
 	mouseEnabled  = true,
+	cursorDitherEnabled = false, -- interactive dither around cursor
+	cursorDitherRadius = 120, -- panel pixels
+	cursorDitherStrength = 0.35, -- 0..1 line attenuation
+	cursorDitherScale = 2, -- dither cell scale
+	cursorDitherPattern = "bayer4", -- bayer4 | checker
 
 	-- ── Colors ───────────────────────────────────────────────
 	bgColor   = { r=0.016, g=0.016, b=0.022, a=1 },
@@ -144,6 +149,11 @@ local CONFIG_RULES = {
 	mouseRadius = { t = "number", min = 0, max = 600 },
 	mouseStrength = { t = "number", min = 0, max = 3.0 },
 	mouseEnabled = { t = "boolean" },
+	cursorDitherEnabled = { t = "boolean" },
+	cursorDitherRadius = { t = "number", min = 0, max = 600 },
+	cursorDitherStrength = { t = "number", min = 0, max = 1 },
+	cursorDitherScale = { t = "number", min = 1, max = 8, integer = true },
+	cursorDitherPattern = { t = "enum", values = { bayer4 = true, checker = true } },
 	bgColor = { t = "color4" },
 	lineColor = { t = "color4" },
 	elevationTint = { t = "boolean" },
@@ -456,6 +466,13 @@ local function contourValue(h, levels, halfW)
 	return fade(1 - saturate(d / halfW))
 end
 
+local BAYER4 = {
+	{ 0,  8,  2, 10 },
+	{ 12, 4, 14,  6 },
+	{ 3, 11,  1,  9 },
+	{ 15, 7, 13,  5 },
+}
+
 -- ================================================================
 --  CONSTRUCTOR
 -- ================================================================
@@ -481,6 +498,7 @@ function TopoShader.new(parentGui, userConfig)
 	self.cfg = cfg
 	self:SetQualityPreset(cfg.qualityPreset or "balanced")
 	self:ApplyFakeBackdropQuality(cfg.fakeLocalBackdropQuality or "balanced")
+	self._states = {}
 
 	-- Internal state
 	self._running   = false
@@ -986,6 +1004,12 @@ function TopoShader:_render(t)
 	-- Convert mouse strength from panel-pixels to noise-space units
 	local mStr     = cfg.mouseStrength * cfg.baseFrequency * 10
 	local mouseWarpEnabled = cfg.mouseEnabled and mStr > 0 and mRad > 0
+	local ditherEnabled = cfg.cursorDitherEnabled
+	local ditherRad = cfg.cursorDitherRadius or mRad
+	local ditherRadSq = ditherRad * ditherRad
+	local ditherStr = cfg.cursorDitherStrength or 0.35
+	local ditherScale = _max(1, cfg.cursorDitherScale or 2)
+	local ditherPattern = cfg.cursorDitherPattern or "bayer4"
 
 	local pixCount = self._pixCount
 
@@ -1071,6 +1095,25 @@ function TopoShader:_render(t)
 		end
 		if lineSharpness ~= 1 then
 			lineV = lineV ^ lineSharpness
+		end
+
+		-- Cursor-centric dither interaction for lines.
+		if ditherEnabled and ditherRad > 0 and dSq < ditherRadSq then
+			local dist = _sqrt(dSq) + 0.0001
+			local fall = 1 - dist / ditherRad
+			fall = fall * fall * (3 - 2 * fall)
+			local cellX = _floor(pX[pi] / ditherScale)
+			local cellY = _floor(pY[pi] / ditherScale)
+			local threshold
+			if ditherPattern == "checker" then
+				threshold = ((cellX + cellY) % 2 == 0) and 0.25 or 0.75
+			else
+				local bx = (cellX % 4) + 1
+				local by = (cellY % 4) + 1
+				threshold = BAYER4[by][bx] / 16
+			end
+			local mask = (fall * ditherStr > threshold) and 0 or 1
+			lineV = lineV * mask
 		end
 
 		if lineV < 0.004 then
@@ -1854,6 +1897,76 @@ function TopoShader:ApplyTopoMode(mode)
 		self:SetConfig(k, v)
 	end
 	self.cfg.topoMode = mode
+	return true
+end
+
+function TopoShader:ExportCurrentConfig()
+	return cloneTable(self.cfg)
+end
+
+function TopoShader:ApplyConfigPreset(preset)
+	if type(preset) ~= "table" then
+		return false, "preset must be a table"
+	end
+	self:Configure(cloneTable(preset))
+	return true
+end
+
+function TopoShader:SetStates(states)
+	if type(states) ~= "table" then
+		return false, "states must be a table"
+	end
+	self._states = {}
+	for name, stateCfg in pairs(states) do
+		if type(name) == "string" and type(stateCfg) == "table" then
+			self._states[name] = cloneTable(stateCfg)
+		end
+	end
+	return true
+end
+
+function TopoShader:RegisterState(name, stateCfg)
+	if type(name) ~= "string" then
+		return false, "state name must be string"
+	end
+	if type(stateCfg) ~= "table" then
+		return false, "state config must be table"
+	end
+	self._states[name] = cloneTable(stateCfg)
+	return true
+end
+
+function TopoShader:SetState(name)
+	local stateCfg = self._states and self._states[name]
+	if not stateCfg then
+		return false, "unknown state: " .. tostring(name)
+	end
+	self:Configure(stateCfg)
+	return true
+end
+
+function TopoShader:ApplyDesignTokens(tokens)
+	if type(tokens) ~= "table" then
+		return false, "tokens must be a table"
+	end
+	local mapped = {}
+	if tokens.surfaceColor then mapped.bgColor = tokens.surfaceColor end
+	if tokens.foregroundColor then mapped.lineColor = tokens.foregroundColor end
+	if tokens.accentLow then mapped.colorLow = tokens.accentLow end
+	if tokens.accentHigh then mapped.colorHigh = tokens.accentHigh end
+	if tokens.tintAmount ~= nil then mapped.tintAmount = tokens.tintAmount end
+	if tokens.motion ~= nil then
+		mapped.animSpeed = _max(0, (self.cfg.animSpeed or 0.02) * tokens.motion)
+	end
+	if tokens.roundness ~= nil then mapped.cornerRadius = tokens.roundness end
+	if tokens.blur ~= nil then
+		mapped.fakeLocalBackdropBlurStrength = tokens.blur
+		mapped.fakeLocalBackdropEnabled = true
+	end
+	if tokens.opacity ~= nil then
+		mapped.outputOpacity = tokens.opacity
+	end
+	self:Configure(mapped)
 	return true
 end
 

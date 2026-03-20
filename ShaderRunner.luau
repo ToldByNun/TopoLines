@@ -63,6 +63,11 @@ local shader = TopoShader.new(script.Parent, {
 	mouseRadius   = 120,
 	mouseStrength = 0.35,
 	mouseEnabled  = false,
+	cursorDitherEnabled = false,
+	cursorDitherRadius = 120,
+	cursorDitherStrength = 0.35,
+	cursorDitherScale = 2,
+	cursorDitherPattern = "bayer4",
 
 	-- Dark navy bg, white lines, blue-to-white elevation tint
 	bgColor   = { r=0.016, g=0.016, b=0.022, a=1 },
@@ -204,6 +209,17 @@ UIS.InputBegan:Connect(function(inp, gp)
 	if k == "M" then
 		shader:SetMouseEnabled(not shader.cfg.mouseEnabled)
 	end
+	-- X = toggle cursor dither interaction
+	if k == "X" then
+		shader:Configure({ cursorDitherEnabled = not shader.cfg.cursorDitherEnabled })
+		print("[TopoShader] cursorDitherEnabled =", shader.cfg.cursorDitherEnabled)
+	end
+	-- C = cycle cursor dither pattern
+	if k == "C" then
+		local p = (shader.cfg.cursorDitherPattern == "bayer4") and "checker" or "bayer4"
+		shader:Configure({ cursorDitherPattern = p, cursorDitherEnabled = true })
+		print("[TopoShader] cursorDitherPattern =", p)
+	end
 	-- ; / ' = mouse strength down / up (layout-safe aliases)
 	if k == "Semicolon" or k == "Minus" then
 		shader:SetMouseInteraction(nil, math.max(0, shader.cfg.mouseStrength - 0.05), nil)
@@ -267,7 +283,7 @@ UIS.InputBegan:Connect(function(inp, gp)
 	end
 	-- H = print keybind help
 	if k == "H" then
-		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 7/8/9 visuals | T theme | G topo mode | Y fake backdrop quality | M mouse | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | N edgeAA quality | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel")
+		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 7/8/9 visuals | T theme | G topo mode | Y fake backdrop quality | M mouse | X cursor dither | C dither pattern | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | N edgeAA quality | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel")
 	end
 	-- J = print schema/template helpers for customization
 	if k == "J" then

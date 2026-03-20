@@ -53,6 +53,10 @@ shader:Configure({
 - `ApplyTheme(name)`
 - `GetThemeNames()`
 - `ApplyFakeBackdropQuality("low" | "balanced" | "high")`
+- `ExportCurrentConfig()` (returns cloned current config table)
+- `ApplyConfigPreset(presetTable)` (safe bulk apply)
+- `SetStates(statesTable)` / `RegisterState(name, cfg)` / `SetState(name)`
+- `ApplyDesignTokens(tokensTable)` (designer-friendly token mapping)
 - `SetDebugEnabled(boolean)`
 - `GetDebugReport()`
 - `FormatDebugReport()`
@@ -181,6 +185,8 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
   - **What**: edge darkening for depth.
 - `theme`
   - **Enum**: `classic`, `ocean`, `neon`, `paper`
+- `topoModeAppliesTheme`
+  - **What**: when true, `ApplyTopoMode` also maps to a matching theme for strong visual shifts.
 
 ### Interaction
 
@@ -188,6 +194,41 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
 - `mouseRadius`
 - `mouseStrength`
   - **Higher strength/radius** can add work and visual warping.
+- `cursorDitherEnabled`
+  - **What**: enables cursor-driven dithering on contour lines.
+- `cursorDitherRadius`
+  - **What**: radius around cursor where dithering applies.
+- `cursorDitherStrength`
+  - **What**: intensity of dither line attenuation.
+- `cursorDitherScale`
+  - **What**: dither cell size.
+- `cursorDitherPattern`
+  - `bayer4` or `checker`.
+
+### Designer State / Token Features
+
+- `SetStates({...})`
+  - Register multiple UI states in one call.
+- `SetState("idle" | "hover" | "pressed" | ...)`
+  - Instantly apply a named visual state.
+- `ApplyDesignTokens({...})`
+  - Designer-centric mapping layer:
+    - `surfaceColor` -> `bgColor`
+    - `foregroundColor` -> `lineColor`
+    - `accentLow`/`accentHigh` -> tint gradient
+    - `motion` -> `animSpeed` scale
+    - `roundness` -> `cornerRadius`
+    - `blur` -> local backdrop blur strength
+    - `opacity` -> `outputOpacity`
+
+## Showcase Runners
+
+The `showcases/` folder includes ready examples:
+
+- `Showcase_Balanced.luau` (baseline production setup)
+- `Showcase_States.luau` (idle/hover/pressed state switching)
+- `Showcase_Tokens.luau` (design token workflows for UI designers)
+- `Showcase_AutoTune_Parallel.luau` (parallel + auto-tune hardware benchmark)
 
 ### Performance / Runtime
 
@@ -321,6 +362,8 @@ shader:ApplyFakeBackdropQuality("high")
 - `T`: cycle theme
 - `Y`: cycle fake local backdrop quality (`low/balanced/high`)
 - `M`: mouse on/off
+- `X`: cursor dither on/off
+- `C`: cursor dither pattern cycle (`bayer4/checker`)
 - `; / '`: mouse strength down/up (`- / =` aliases included)
 - `, / .`: mouse radius down/up
 - `V`: vignette on/off
