@@ -23,6 +23,7 @@ local DEFAULTS = {
 	-- Half of panel = 2x faster, bilinear stretch looks fine
 	renderWidth  = 230,
 	renderHeight = 150,
+	upscaleMode = "bilinear", -- bilinear | nearest
 
 	-- ── Contour appearance ───────────────────────────────────
 	contourLevels = 12,    -- how many contour bands
@@ -45,6 +46,7 @@ local DEFAULTS = {
 	fastMode    = true,   -- use cheaper height sampling path
 	ultraFastMode = false, -- minimal noise path for weak CPUs
 	checkerboardReconstruction = false, -- cleaner default (no checkerboard stipple)
+	interlacedMode = "off", -- off | checkerboard
 	temporalBlend = 0.12, -- lower history weight = cleaner/less ghosting
 
 	-- ── Animation ────────────────────────────────────────────
@@ -88,6 +90,24 @@ local DEFAULTS = {
 	lineAAStep      = 0.55, -- noise-space pixel step factor
 	lineAAMode      = "msaa4", -- off | fast | msaa4
 	lineAASubpixel  = 0.35, -- subpixel offset scale for msaa sampling
+	analyticalAAEnabled = true, -- explicit analytical line AA widening
+	analyticalAAStrength = 0.85, -- 0..2 analytical coverage strength
+	softEdgesEnabled = true, -- soft analytical edge coverage in contour buffer
+	softEdgeWidth = 0.30, -- transition width relative to line half-width
+	softEdgeCurve = 1.0, -- >1 crisper, <1 softer
+	adaptiveSamplingEnabled = true, -- allocate AA samples based on local edge importance
+	aaEdgeThreshold = 0.012, -- gradient threshold before expensive subpixel sampling
+	verticalAABoost = 0.75, -- extra subpixel spread on vertical-dominant edges
+	generatorScaleEnabled = true, -- edge-aware reconstruction smoothing pass
+	generatorScaleStrength = 0.42, -- 0..1 blend amount
+	generatorScaleThreshold = 0.08, -- 0..1 edge trigger sensitivity
+	generatorScaleAlpha = 0.70, -- alpha blend contribution for edge softening
+	generatorScaleInterval = 2, -- run every Nth frame to control budget
+	generatorVerticalBias = 1.35, -- spend more reconstruction on vertical edges
+	fakeAABlurEnabled = false, -- tiny edge-gated blur as perceptual AA helper
+	fakeAABlurStrength = 0.16, -- 0..1 blur blend amount
+	fakeAABlurThreshold = 0.06, -- 0..1 edge sensitivity (lower = more blur)
+	fakeAABlurInterval = 2, -- run every Nth frame
 
 	-- Runtime quality control
 	qualityPreset      = "balanced", -- performance | balanced | quality
@@ -102,6 +122,10 @@ local DEFAULTS = {
 	parallelEnabled    = false,      -- requires Actor setup in hierarchy
 	parallelWorkers    = 4,          -- desired worker count
 	parallelChunkRows  = 32,         -- rows per worker chunk
+	parallelTileWidth  = 64,         -- tile width for worker jobs
+	parallelTileHeight = 64,         -- tile height for worker jobs
+	parallelProgressive = true,      -- update subset of tiles each frame
+	parallelTilesPerFrame = 6,       -- tiles to update per frame (progressive mode)
 
 	-- ── Misc ─────────────────────────────────────────────────
 	fps          = 60,
@@ -143,6 +167,7 @@ local CONFIG_RULES = {
 	fastMode = { t = "boolean" },
 	ultraFastMode = { t = "boolean" },
 	checkerboardReconstruction = { t = "boolean" },
+	interlacedMode = { t = "enum", values = { off = true, checkerboard = true } },
 	temporalBlend = { t = "number", min = 0, max = 0.5 },
 	animSpeed = { t = "number", min = 0, max = 0.2 },
 	animAngle = { t = "number", min = -6.3, max = 6.3 },
@@ -172,6 +197,25 @@ local CONFIG_RULES = {
 	lineAAStep = { t = "number", min = 0.1, max = 2 },
 	lineAAMode = { t = "enum", values = { off = true, fast = true, msaa4 = true } },
 	lineAASubpixel = { t = "number", min = 0.1, max = 1.0 },
+	analyticalAAEnabled = { t = "boolean" },
+	analyticalAAStrength = { t = "number", min = 0, max = 2 },
+	softEdgesEnabled = { t = "boolean" },
+	softEdgeWidth = { t = "number", min = 0, max = 1.0 },
+	softEdgeCurve = { t = "number", min = 0.5, max = 2.5 },
+	adaptiveSamplingEnabled = { t = "boolean" },
+	aaEdgeThreshold = { t = "number", min = 0, max = 0.1 },
+	verticalAABoost = { t = "number", min = 0, max = 2.0 },
+	generatorScaleEnabled = { t = "boolean" },
+	generatorScaleStrength = { t = "number", min = 0, max = 1 },
+	generatorScaleThreshold = { t = "number", min = 0, max = 1 },
+	generatorScaleAlpha = { t = "number", min = 0, max = 1 },
+	generatorScaleInterval = { t = "number", min = 1, max = 8, integer = true },
+	generatorVerticalBias = { t = "number", min = 0.5, max = 2.0 },
+	fakeAABlurEnabled = { t = "boolean" },
+	fakeAABlurStrength = { t = "number", min = 0, max = 1 },
+	fakeAABlurThreshold = { t = "number", min = 0, max = 1 },
+	fakeAABlurInterval = { t = "number", min = 1, max = 8, integer = true },
+	upscaleMode = { t = "enum", values = { bilinear = true, nearest = true } },
 	qualityPreset = { t = "enum", values = { performance = true, balanced = true, quality = true } },
 	adaptiveQuality = { t = "boolean" },
 	frameBudgetMs = { t = "number", min = 6, max = 40 },
@@ -184,6 +228,10 @@ local CONFIG_RULES = {
 	parallelEnabled = { t = "boolean" },
 	parallelWorkers = { t = "number", min = 1, max = 16, integer = true },
 	parallelChunkRows = { t = "number", min = 8, max = 128, integer = true },
+	parallelTileWidth = { t = "number", min = 16, max = 256, integer = true },
+	parallelTileHeight = { t = "number", min = 16, max = 256, integer = true },
+	parallelProgressive = { t = "boolean" },
+	parallelTilesPerFrame = { t = "number", min = 1, max = 128, integer = true },
 	fps = { t = "number", min = 1, max = 240, integer = true },
 	cornerRadius = { t = "number", min = 0, max = 80, integer = true },
 	theme = { t = "enum", values = { classic = true, ocean = true, neon = true, paper = true } },
@@ -292,6 +340,46 @@ local TOPO_MODES = {
 		lineColor = { r=0.96, g=0.93, b=1.00, a=1 },
 		elevationTint = true, colorLow = { r=0.56, g=0.18, b=0.98 }, colorHigh = { r=0.50, g=0.98, b=0.94 }, tintAmount = 0.70,
 	},
+	wireframe = {
+		lineWidth = 0.055, lineSharpness = 1.15, contourLevels = 18,
+		lineAAMode = "msaa4", lineAAStrength = 2.0, edgeAAEnabled = true, edgeAAQuality = "hq", edgeAAStrength = 0.40,
+		glowEnabled = false, animSpeed = 0.02,
+		bgColor = { r=0.010, g=0.012, b=0.016, a=1 },
+		lineColor = { r=0.62, g=0.95, b=1.00, a=1 },
+		elevationTint = true, colorLow = { r=0.20, g=0.75, b=1.00 }, colorHigh = { r=0.85, g=1.00, b=1.00 }, tintAmount = 0.32,
+	},
+	molten = {
+		lineWidth = 0.11, lineSharpness = 0.9, contourLevels = 10,
+		lineAAMode = "fast", lineAAStrength = 2.2, edgeAAEnabled = true, edgeAAQuality = "hq", edgeAAStrength = 0.58,
+		glowEnabled = true, glowStrength = 0.16, animSpeed = 0.015,
+		bgColor = { r=0.05, g=0.01, b=0.00, a=1 },
+		lineColor = { r=1.00, g=0.75, b=0.30, a=1 },
+		elevationTint = true, colorLow = { r=0.90, g=0.20, b=0.02 }, colorHigh = { r=1.00, g=0.95, b=0.45 }, tintAmount = 0.78,
+	},
+	glacier = {
+		lineWidth = 0.085, lineSharpness = 0.96, contourLevels = 12,
+		lineAAMode = "msaa4", lineAAStrength = 2.4, edgeAAEnabled = true, edgeAAQuality = "hq", edgeAAStrength = 0.50,
+		glowEnabled = false, animSpeed = 0.01,
+		bgColor = { r=0.00, g=0.03, b=0.06, a=1 },
+		lineColor = { r=0.88, g=0.98, b=1.00, a=1 },
+		elevationTint = true, colorLow = { r=0.22, g=0.62, b=0.95 }, colorHigh = { r=0.92, g=1.00, b=1.00 }, tintAmount = 0.56,
+	},
+	radar = {
+		lineWidth = 0.09, lineSharpness = 1.0, contourLevels = 14,
+		lineAAMode = "fast", lineAAStrength = 1.8, edgeAAEnabled = false,
+		glowEnabled = true, glowStrength = 0.10, animSpeed = 0.028,
+		bgColor = { r=0.00, g=0.03, b=0.01, a=1 },
+		lineColor = { r=0.55, g=1.00, b=0.65, a=1 },
+		elevationTint = true, colorLow = { r=0.10, g=0.65, b=0.18 }, colorHigh = { r=0.75, g=1.00, b=0.80 }, tintAmount = 0.48,
+	},
+	sunset = {
+		lineWidth = 0.10, lineSharpness = 0.92, contourLevels = 11,
+		lineAAMode = "msaa4", lineAAStrength = 2.5, edgeAAEnabled = true, edgeAAQuality = "hq", edgeAAStrength = 0.56,
+		glowEnabled = true, glowStrength = 0.11, animSpeed = 0.014,
+		bgColor = { r=0.08, g=0.02, b=0.07, a=1 },
+		lineColor = { r=1.00, g=0.86, b=0.70, a=1 },
+		elevationTint = true, colorLow = { r=0.94, g=0.32, b=0.45 }, colorHigh = { r=1.00, g=0.85, b=0.50 }, tintAmount = 0.68,
+	},
 }
 
 local TOPO_MODE_THEME = {
@@ -300,6 +388,11 @@ local TOPO_MODE_THEME = {
 	precision = "ocean",
 	bold = "paper",
 	dream = "neon",
+	wireframe = "ocean",
+	molten = "classic",
+	glacier = "ocean",
+	radar = "classic",
+	sunset = "neon",
 }
 
 -- ================================================================
@@ -460,10 +553,23 @@ local function contour(h, levels, halfW)
 	return fade(t)
 end
 
-local function contourValue(h, levels, halfW)
+local function contourValue(h, levels, halfW, softEnabled, softWidth, softCurve)
 	local bandPos = (h * levels) % 1.0
 	local d = _min(bandPos, 1 - bandPos)
-	return fade(1 - saturate(d / halfW))
+	if not softEnabled then
+		return fade(1 - saturate(d / halfW))
+	end
+	local w = _max(0.0001, halfW)
+	local sw = _max(0, _min(1, softWidth or 0)) * w
+	local i0 = _max(0, w - sw)
+	local i1 = w + sw
+	local t = saturate((d - i0) / _max(0.0001, i1 - i0))
+	local cov = 1 - fade(t)
+	local c = _max(0.5, softCurve or 1)
+	if c ~= 1 then
+		cov = cov ^ c
+	end
+	return cov
 end
 
 local BAYER4 = {
@@ -546,6 +652,8 @@ function TopoShader.new(parentGui, userConfig)
 	self._parallelPending = 0
 	self._parallelFrameReady = false
 	self._parallelFrameTime = 0
+	self._parallelTiles = {}
+	self._parallelTileCursor = 1
 	self._autoTune = nil
 
 	-- Pre-bake noise-space XY per pixel
@@ -635,6 +743,7 @@ function TopoShader.new(parentGui, userConfig)
 		local uc = Instance.new("UICorner")
 		uc.CornerRadius = UDim.new(0, cfg.cornerRadius)
 		uc.Parent = clip
+		self._clipCorner = uc
 	end
 
 	-- ImageLabel  (will display our EditableImage)
@@ -644,10 +753,17 @@ function TopoShader.new(parentGui, userConfig)
 	img.BackgroundTransparency = 1
 	img.BorderSizePixel        = 0
 	img.ScaleType              = Enum.ScaleType.Stretch
+	img.ResampleMode           = (cfg.upscaleMode == "nearest") and Enum.ResamplerMode.Pixelated or Enum.ResamplerMode.Default
 	img.ImageTransparency      = cfg.imageTransparency or 0
 	img.ZIndex                 = 2
 	img.Parent                 = clip
 	self._img = img
+	do
+		local uc = Instance.new("UICorner")
+		uc.CornerRadius = UDim.new(0, cfg.cornerRadius)
+		uc.Parent = img
+		self._imgCorner = uc
+	end
 
 	-- Optional localized backdrop "cheese blur" layer (ViewportFrame)
 	local vpf = Instance.new("ViewportFrame")
@@ -658,8 +774,15 @@ function TopoShader.new(parentGui, userConfig)
 	vpf.ImageTransparency = 1 - (cfg.fakeLocalBackdropAlpha or 0.35)
 	vpf.ZIndex = 1
 	vpf.Visible = cfg.fakeLocalBackdropEnabled and true or false
+	vpf.ClipsDescendants = true
 	vpf.Parent = clip
 	self._vpf = vpf
+	do
+		local uc = Instance.new("UICorner")
+		uc.CornerRadius = UDim.new(0, cfg.cornerRadius)
+		uc.Parent = vpf
+		self._vpfCorner = uc
+	end
 
 	local wm = Instance.new("WorldModel")
 	wm.Name = "BackdropWorld"
@@ -869,21 +992,21 @@ function TopoShader:_applyEdgeAA()
 					local dr = d + 4
 					avgR = (
 						buffer.readu8(src, l) + buffer.readu8(src, r) +
-						buffer.readu8(src, u) + buffer.readu8(src, d) +
-						buffer.readu8(src, ul) + buffer.readu8(src, ur) +
-						buffer.readu8(src, dl) + buffer.readu8(src, dr)
+							buffer.readu8(src, u) + buffer.readu8(src, d) +
+							buffer.readu8(src, ul) + buffer.readu8(src, ur) +
+							buffer.readu8(src, dl) + buffer.readu8(src, dr)
 					) * 0.125
 					avgG = (
 						buffer.readu8(src, l + 1) + buffer.readu8(src, r + 1) +
-						buffer.readu8(src, u + 1) + buffer.readu8(src, d + 1) +
-						buffer.readu8(src, ul + 1) + buffer.readu8(src, ur + 1) +
-						buffer.readu8(src, dl + 1) + buffer.readu8(src, dr + 1)
+							buffer.readu8(src, u + 1) + buffer.readu8(src, d + 1) +
+							buffer.readu8(src, ul + 1) + buffer.readu8(src, ur + 1) +
+							buffer.readu8(src, dl + 1) + buffer.readu8(src, dr + 1)
 					) * 0.125
 					avgB = (
 						buffer.readu8(src, l + 2) + buffer.readu8(src, r + 2) +
-						buffer.readu8(src, u + 2) + buffer.readu8(src, d + 2) +
-						buffer.readu8(src, ul + 2) + buffer.readu8(src, ur + 2) +
-						buffer.readu8(src, dl + 2) + buffer.readu8(src, dr + 2)
+							buffer.readu8(src, u + 2) + buffer.readu8(src, d + 2) +
+							buffer.readu8(src, ul + 2) + buffer.readu8(src, ur + 2) +
+							buffer.readu8(src, dl + 2) + buffer.readu8(src, dr + 2)
 					) * 0.125
 				else
 					avgR = (buffer.readu8(src, l) + buffer.readu8(src, r) + buffer.readu8(src, u) + buffer.readu8(src, d)) * 0.25
@@ -909,6 +1032,196 @@ function TopoShader:_applyEdgeAA()
 	end
 end
 
+-- Generator scaling: edge-aware reconstruction filter.
+-- Smooths jagged transitions while preserving flat regions/details better than simple blur.
+function TopoShader:_applyGeneratorScale()
+	local src = self._buf
+	local dst = self._aaBuf
+	local rW = self._rW
+	local rH = self._rH
+	local str = saturate(self.cfg.generatorScaleStrength or 0.42)
+	local thr = saturate(self.cfg.generatorScaleThreshold or 0.08)
+	local aStr = saturate(self.cfg.generatorScaleAlpha or 0.70)
+	local vBias = _max(0.5, self.cfg.generatorVerticalBias or 1.35)
+	if str <= 0 then
+		return
+	end
+
+	-- Copy borders unchanged.
+	for col = 0, rW - 1 do
+		local top = col * 4
+		local bot = ((rH - 1) * rW + col) * 4
+		for ch = 0, 3 do
+			buffer.writeu8(dst, top + ch, buffer.readu8(src, top + ch))
+			buffer.writeu8(dst, bot + ch, buffer.readu8(src, bot + ch))
+		end
+	end
+	for row = 1, rH - 2 do
+		local left = (row * rW) * 4
+		local right = (row * rW + (rW - 1)) * 4
+		for ch = 0, 3 do
+			buffer.writeu8(dst, left + ch, buffer.readu8(src, left + ch))
+			buffer.writeu8(dst, right + ch, buffer.readu8(src, right + ch))
+		end
+	end
+
+	for row = 1, rH - 2 do
+		for col = 1, rW - 2 do
+			local c = (row * rW + col) * 4
+			local l = c - 4
+			local r = c + 4
+			local u = c - rW * 4
+			local d = c + rW * 4
+
+			local cr = buffer.readu8(src, c)
+			local cg = buffer.readu8(src, c + 1)
+			local cb = buffer.readu8(src, c + 2)
+			local ca = buffer.readu8(src, c + 3)
+			local lumC = cr * 0.299 + cg * 0.587 + cb * 0.114
+			local lumL = buffer.readu8(src, l) * 0.299 + buffer.readu8(src, l + 1) * 0.587 + buffer.readu8(src, l + 2) * 0.114
+			local lumR = buffer.readu8(src, r) * 0.299 + buffer.readu8(src, r + 1) * 0.587 + buffer.readu8(src, r + 2) * 0.114
+			local lumU = buffer.readu8(src, u) * 0.299 + buffer.readu8(src, u + 1) * 0.587 + buffer.readu8(src, u + 2) * 0.114
+			local lumD = buffer.readu8(src, d) * 0.299 + buffer.readu8(src, d + 1) * 0.587 + buffer.readu8(src, d + 2) * 0.114
+
+			local accR, accG, accB, accA = 0, 0, 0, 0
+			local wSum = 0
+			local maxEdge = 0
+
+			local function sampleNeighbor(n)
+				local nr = buffer.readu8(src, n)
+				local ng = buffer.readu8(src, n + 1)
+				local nb = buffer.readu8(src, n + 2)
+				local na = buffer.readu8(src, n + 3)
+				local lumN = nr * 0.299 + ng * 0.587 + nb * 0.114
+				local contrast = _abs(lumN - lumC) / 255
+				local edgeW = saturate((contrast - thr) / _max(0.0001, 1 - thr))
+				local rangeW = 1 - contrast * 0.85
+				local alphaW = 1 - (_abs(na - ca) / 255) * 0.65
+				local w = edgeW * rangeW * alphaW
+				if w > 0 then
+					accR += nr * w
+					accG += ng * w
+					accB += nb * w
+					accA += na * w
+					wSum += w
+					if edgeW > maxEdge then
+						maxEdge = edgeW
+					end
+				end
+			end
+
+			sampleNeighbor(l)
+			sampleNeighbor(r)
+			sampleNeighbor(u)
+			sampleNeighbor(d)
+			sampleNeighbor(u - 4)
+			sampleNeighbor(u + 4)
+			sampleNeighbor(d - 4)
+			sampleNeighbor(d + 4)
+
+			if wSum > 0 then
+				local avgR = accR / wSum
+				local avgG = accG / wSum
+				local avgB = accB / wSum
+				local avgA = accA / wSum
+				local gx = _abs(lumR - lumL)
+				local gy = _abs(lumD - lumU)
+				local verticalDom = saturate((gx - gy) / _max(1, gx + gy))
+				local dirBoost = 1 + (vBias - 1) * verticalDom
+				local k = saturate(str * maxEdge * dirBoost)
+				buffer.writeu8(dst, c, _floor(cr * (1 - k) + avgR * k + 0.5))
+				buffer.writeu8(dst, c + 1, _floor(cg * (1 - k) + avgG * k + 0.5))
+				buffer.writeu8(dst, c + 2, _floor(cb * (1 - k) + avgB * k + 0.5))
+				buffer.writeu8(dst, c + 3, _floor(ca * (1 - aStr * k) + avgA * (aStr * k) + 0.5))
+			else
+				buffer.writeu8(dst, c, cr)
+				buffer.writeu8(dst, c + 1, cg)
+				buffer.writeu8(dst, c + 2, cb)
+				buffer.writeu8(dst, c + 3, ca)
+			end
+		end
+	end
+
+	for i = 0, self._pixCount * 4 - 1 do
+		buffer.writeu8(src, i, buffer.readu8(dst, i))
+	end
+end
+
+-- Tiny edge-gated blur pass (fake AA helper).
+-- Applies only where local contrast crosses threshold to avoid global softness.
+function TopoShader:_applyFakeAABlur()
+	local src = self._buf
+	local dst = self._aaBuf
+	local rW = self._rW
+	local rH = self._rH
+	local str = saturate(self.cfg.fakeAABlurStrength or 0.16)
+	local thr = saturate(self.cfg.fakeAABlurThreshold or 0.06)
+	if str <= 0 then
+		return
+	end
+
+	for col = 0, rW - 1 do
+		local top = col * 4
+		local bot = ((rH - 1) * rW + col) * 4
+		for ch = 0, 3 do
+			buffer.writeu8(dst, top + ch, buffer.readu8(src, top + ch))
+			buffer.writeu8(dst, bot + ch, buffer.readu8(src, bot + ch))
+		end
+	end
+	for row = 1, rH - 2 do
+		local left = (row * rW) * 4
+		local right = (row * rW + (rW - 1)) * 4
+		for ch = 0, 3 do
+			buffer.writeu8(dst, left + ch, buffer.readu8(src, left + ch))
+			buffer.writeu8(dst, right + ch, buffer.readu8(src, right + ch))
+		end
+	end
+
+	for row = 1, rH - 2 do
+		for col = 1, rW - 2 do
+			local c = (row * rW + col) * 4
+			local l = c - 4
+			local r = c + 4
+			local u = c - rW * 4
+			local d = c + rW * 4
+
+			local cr = buffer.readu8(src, c)
+			local cg = buffer.readu8(src, c + 1)
+			local cb = buffer.readu8(src, c + 2)
+			local ca = buffer.readu8(src, c + 3)
+
+			local lumC = cr * 0.299 + cg * 0.587 + cb * 0.114
+			local lumL = buffer.readu8(src, l) * 0.299 + buffer.readu8(src, l + 1) * 0.587 + buffer.readu8(src, l + 2) * 0.114
+			local lumR = buffer.readu8(src, r) * 0.299 + buffer.readu8(src, r + 1) * 0.587 + buffer.readu8(src, r + 2) * 0.114
+			local lumU = buffer.readu8(src, u) * 0.299 + buffer.readu8(src, u + 1) * 0.587 + buffer.readu8(src, u + 2) * 0.114
+			local lumD = buffer.readu8(src, d) * 0.299 + buffer.readu8(src, d + 1) * 0.587 + buffer.readu8(src, d + 2) * 0.114
+			local contrast = _max(_max(_abs(lumC - lumL), _abs(lumC - lumR)), _max(_abs(lumC - lumU), _abs(lumC - lumD))) / 255
+			local edgeK = saturate((contrast - thr) / _max(0.0001, 1 - thr))
+			local k = str * edgeK
+
+			if k > 0 then
+				local avgR = (buffer.readu8(src, l) + buffer.readu8(src, r) + buffer.readu8(src, u) + buffer.readu8(src, d) + cr * 2) / 6
+				local avgG = (buffer.readu8(src, l + 1) + buffer.readu8(src, r + 1) + buffer.readu8(src, u + 1) + buffer.readu8(src, d + 1) + cg * 2) / 6
+				local avgB = (buffer.readu8(src, l + 2) + buffer.readu8(src, r + 2) + buffer.readu8(src, u + 2) + buffer.readu8(src, d + 2) + cb * 2) / 6
+				local avgA = (buffer.readu8(src, l + 3) + buffer.readu8(src, r + 3) + buffer.readu8(src, u + 3) + buffer.readu8(src, d + 3) + ca * 2) / 6
+				buffer.writeu8(dst, c, _floor(cr * (1 - k) + avgR * k + 0.5))
+				buffer.writeu8(dst, c + 1, _floor(cg * (1 - k) + avgG * k + 0.5))
+				buffer.writeu8(dst, c + 2, _floor(cb * (1 - k) + avgB * k + 0.5))
+				buffer.writeu8(dst, c + 3, _floor(ca * (1 - k) + avgA * k + 0.5))
+			else
+				buffer.writeu8(dst, c, cr)
+				buffer.writeu8(dst, c + 1, cg)
+				buffer.writeu8(dst, c + 2, cb)
+				buffer.writeu8(dst, c + 3, ca)
+			end
+		end
+	end
+
+	for i = 0, self._pixCount * 4 - 1 do
+		buffer.writeu8(src, i, buffer.readu8(dst, i))
+	end
+end
+
 -- ================================================================
 --  RENDER FRAME
 -- ================================================================
@@ -921,6 +1234,12 @@ function TopoShader:_render(t)
 		if self._parallelFrameReady then
 			if self.cfg.edgeAAEnabled and (self._frameId % _max(1, self.cfg.edgeAAInterval or 1) == 0) then
 				self:_applyEdgeAA()
+			end
+			if self.cfg.generatorScaleEnabled and (self._frameId % _max(1, self.cfg.generatorScaleInterval or 1) == 0) then
+				self:_applyGeneratorScale()
+			end
+			if self.cfg.fakeAABlurEnabled and (self._frameId % _max(1, self.cfg.fakeAABlurInterval or 1) == 0) then
+				self:_applyFakeAABlur()
 			end
 			self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), self._buf)
 			self._parallelFrameReady = false
@@ -988,6 +1307,14 @@ function TopoShader:_render(t)
 	local aaStep = (cfg.baseFrequency or 0.008) * (cfg.lineAAStep or 0.55)
 	local lineAAMode = cfg.lineAAMode or "fast"
 	local subpixel = cfg.lineAASubpixel or 0.35
+	local analyticalAAEnabled = cfg.analyticalAAEnabled
+	local analyticalAAStrength = cfg.analyticalAAStrength or 0.85
+	local softEdgesEnabled = cfg.softEdgesEnabled
+	local softEdgeWidth = cfg.softEdgeWidth or 0.30
+	local softEdgeCurve = cfg.softEdgeCurve or 1.0
+	local adaptiveSamplingEnabled = cfg.adaptiveSamplingEnabled
+	local aaEdgeThreshold = cfg.aaEdgeThreshold or 0.012
+	local verticalAABoost = cfg.verticalAABoost or 0.75
 
 	-- Animate: drift the whole noise field slowly
 	local driftX = _cos(cfg.animAngle) * cfg.animSpeed * t
@@ -1055,6 +1382,7 @@ function TopoShader:_render(t)
 		local bandPos = (h * levels) % 1.0
 		local d = _min(bandPos, 1 - bandPos)
 		local aaHalfW = halfW
+		local gradX, gradY, gradH = 0, 0, 0
 		if lineAAEnabled and lineAAMode ~= "off" then
 			local hx, hy
 			if ultraFast then
@@ -1067,31 +1395,58 @@ function TopoShader:_render(t)
 				hx = heightField(nx + aaStep, ny, zSlice, oct, lac, per, warp)
 				hy = heightField(nx, ny + aaStep, zSlice, oct, lac, per, warp)
 			end
-			local gradH = _abs(hx - h) + _abs(hy - h)
+			gradX = _abs(hx - h)
+			gradY = _abs(hy - h)
+			gradH = gradX + gradY
 			aaHalfW = halfW + gradH * lineAAStrength
+			if analyticalAAEnabled then
+				-- Analytical widening proportional to local iso-line slope.
+				local analyticalW = gradH * levels * 0.08 * analyticalAAStrength
+				aaHalfW = aaHalfW + analyticalW
+			end
 		end
-		local tEdge = 1 - saturate(d / aaHalfW)
-		local lineV = fade(tEdge)
+		local lineV = contourValue(h, levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
 		if lineAAEnabled and lineAAMode == "msaa4" then
-			local so = aaStep * subpixel
-			local function sampleH(sx, sy)
-				if ultraFast then
-					return heightFieldUltra(sx, sy, zSlice, lac, per, warp)
-				elseif fastMode then
-					return heightFieldFast(sx, sy, zSlice, oct, lac, per, warp)
+			local edgeImportant = (not adaptiveSamplingEnabled) or (gradH >= aaEdgeThreshold)
+			if edgeImportant then
+				local so = aaStep * subpixel
+				local function sampleH(sx, sy)
+					if ultraFast then
+						return heightFieldUltra(sx, sy, zSlice, lac, per, warp)
+					elseif fastMode then
+						return heightFieldFast(sx, sy, zSlice, oct, lac, per, warp)
+					else
+						return heightField(sx, sy, zSlice, oct, lac, per, warp)
+					end
+				end
+				if not adaptiveSamplingEnabled then
+					local h1 = sampleH(nx - so, ny - so)
+					local h2 = sampleH(nx + so, ny - so)
+					local h3 = sampleH(nx - so, ny + so)
+					local h4 = sampleH(nx + so, ny + so)
+					local m1 = contourValue(h1, levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+					local m2 = contourValue(h2, levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+					local m3 = contourValue(h3, levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+					local m4 = contourValue(h4, levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+					lineV = (lineV + m1 + m2 + m3 + m4) * 0.2
 				else
-					return heightField(sx, sy, zSlice, oct, lac, per, warp)
+					local verticalDom = saturate((gradX - gradY) / _max(0.0001, gradH))
+					local hSum, n = lineV, 1
+					if verticalDom > 0.12 then
+						local soV = so * (1 + verticalAABoost * verticalDom)
+						hSum += contourValue(sampleH(nx - soV, ny), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						hSum += contourValue(sampleH(nx + soV, ny), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						hSum += contourValue(sampleH(nx - so, ny - so), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						hSum += contourValue(sampleH(nx + so, ny + so), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						n = 5
+					else
+						hSum += contourValue(sampleH(nx, ny - so), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						hSum += contourValue(sampleH(nx, ny + so), levels, aaHalfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
+						n = 3
+					end
+					lineV = hSum / n
 				end
 			end
-			local h1 = sampleH(nx - so, ny - so)
-			local h2 = sampleH(nx + so, ny - so)
-			local h3 = sampleH(nx - so, ny + so)
-			local h4 = sampleH(nx + so, ny + so)
-			local m1 = contourValue(h1, levels, aaHalfW)
-			local m2 = contourValue(h2, levels, aaHalfW)
-			local m3 = contourValue(h3, levels, aaHalfW)
-			local m4 = contourValue(h4, levels, aaHalfW)
-			lineV = (lineV + m1 + m2 + m3 + m4) * 0.2
 		end
 		if lineSharpness ~= 1 then
 			lineV = lineV ^ lineSharpness
@@ -1116,23 +1471,20 @@ function TopoShader:_render(t)
 			lineV = lineV * mask
 		end
 
-		if lineV < 0.004 then
-			r, g, b, a = bgR, bgG, bgB, bgA
-		else
-			r, g, b = lnR, lnG, lnB
-			if doTint then
-				local tr = loR + (hiR - loR) * h
-				local tg = loG + (hiG - loG) * h
-				local tb = loB + (hiB - loB) * h
-				r = r * invTint + tr * tintAmt
-				g = g * invTint + tg * tintAmt
-				b = b * invTint + tb * tintAmt
-			end
-			r = lerp(bgR, r, lineV)
-			g = lerp(bgG, g, lineV)
-			b = lerp(bgB, b, lineV)
-			a = lerp(bgA, lnA, lineV)
+		-- Analytical AA path: always blend continuously (no binary line threshold branch).
+		r, g, b = lnR, lnG, lnB
+		if doTint then
+			local tr = loR + (hiR - loR) * h
+			local tg = loG + (hiG - loG) * h
+			local tb = loB + (hiB - loB) * h
+			r = r * invTint + tr * tintAmt
+			g = g * invTint + tg * tintAmt
+			b = b * invTint + tb * tintAmt
 		end
+		r = lerp(bgR, r, lineV)
+		g = lerp(bgG, g, lineV)
+		b = lerp(bgB, b, lineV)
+		a = lerp(bgA, lnA, lineV)
 
 		-- Write to Luau buffer (RGBA u8)
 		local ur = _floor(saturate(r) * 255 + 0.5)
@@ -1172,6 +1524,12 @@ function TopoShader:_render(t)
 	end
 	if cfg.edgeAAEnabled and (self._frameId % _max(1, cfg.edgeAAInterval or 1) == 0) then
 		self:_applyEdgeAA()
+	end
+	if cfg.generatorScaleEnabled and (self._frameId % _max(1, cfg.generatorScaleInterval or 1) == 0) then
+		self:_applyGeneratorScale()
+	end
+	if cfg.fakeAABlurEnabled and (self._frameId % _max(1, cfg.fakeAABlurInterval or 1) == 0) then
+		self:_applyFakeAABlur()
 	end
 
 	-- Single GPU upload — the entire buffer in one call
@@ -1280,6 +1638,21 @@ function TopoShader:SetConfig(key, value)
 	if key == "imageTransparency" and self._img then
 		self._img.ImageTransparency = self.cfg.imageTransparency or 0
 	end
+	if key == "upscaleMode" and self._img then
+		self._img.ResampleMode = (self.cfg.upscaleMode == "nearest") and Enum.ResamplerMode.Pixelated or Enum.ResamplerMode.Default
+	end
+	if key == "interlacedMode" then
+		self.cfg.checkerboardReconstruction = (self.cfg.interlacedMode == "checkerboard")
+	end
+	if key == "checkerboardReconstruction" then
+		self.cfg.interlacedMode = self.cfg.checkerboardReconstruction and "checkerboard" or "off"
+	end
+	if key == "cornerRadius" then
+		local cr = UDim.new(0, self.cfg.cornerRadius or 0)
+		if self._clipCorner then self._clipCorner.CornerRadius = cr end
+		if self._imgCorner then self._imgCorner.CornerRadius = cr end
+		if self._vpfCorner then self._vpfCorner.CornerRadius = cr end
+	end
 
 	-- Rebuild coord cache if spatial frequency changed
 	if key == "baseFrequency" then
@@ -1302,6 +1675,9 @@ function TopoShader:SetConfig(key, value)
 	end
 	if key == "parallelEnabled" then
 		self:SetParallelEnabled(self.cfg.parallelEnabled)
+	end
+	if key == "parallelTileWidth" or key == "parallelTileHeight" then
+		self:_rebuildParallelTiles()
 	end
 	if key == "qualityPreset" then
 		self:SetQualityPreset(self.cfg.qualityPreset)
@@ -1361,6 +1737,12 @@ function TopoShader:SetQualityPreset(preset)
 		self.cfg.edgeAAEnabled = false
 		self.cfg.lineAAEnabled = false
 		self.cfg.lineAAMode = "off"
+		self.cfg.analyticalAAEnabled = false
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.020
+		self.cfg.verticalAABoost = 0.45
+		self.cfg.generatorScaleEnabled = false
+		self.cfg.fakeAABlurEnabled = false
 		self.cfg.edgeAAInterval = 3
 		self.cfg.glowEnabled = false
 		self.cfg.warpAmount = _min(self.cfg.warpAmount, 0.75)
@@ -1376,6 +1758,21 @@ function TopoShader:SetQualityPreset(preset)
 		self.cfg.lineAAEnabled = true
 		self.cfg.lineAAStrength = 2.4
 		self.cfg.lineAAMode = "msaa4"
+		self.cfg.analyticalAAEnabled = true
+		self.cfg.analyticalAAStrength = 1.0
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.008
+		self.cfg.verticalAABoost = 1.05
+		self.cfg.generatorScaleEnabled = true
+		self.cfg.generatorScaleStrength = 0.56
+		self.cfg.generatorScaleThreshold = 0.06
+		self.cfg.generatorScaleAlpha = 0.82
+		self.cfg.generatorScaleInterval = 1
+		self.cfg.generatorVerticalBias = 1.45
+		self.cfg.fakeAABlurEnabled = true
+		self.cfg.fakeAABlurStrength = 0.14
+		self.cfg.fakeAABlurThreshold = 0.05
+		self.cfg.fakeAABlurInterval = 1
 		self.cfg.edgeAAInterval = 1
 		self.cfg.glowEnabled = false
 		self.cfg.octaves = _min(6, self.cfg.octaves + 1)
@@ -1389,6 +1786,21 @@ function TopoShader:SetQualityPreset(preset)
 		self.cfg.lineAAEnabled = true
 		self.cfg.lineAAStrength = 2.0
 		self.cfg.lineAAMode = "fast"
+		self.cfg.analyticalAAEnabled = true
+		self.cfg.analyticalAAStrength = 0.85
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.012
+		self.cfg.verticalAABoost = 0.75
+		self.cfg.generatorScaleEnabled = true
+		self.cfg.generatorScaleStrength = 0.42
+		self.cfg.generatorScaleThreshold = 0.08
+		self.cfg.generatorScaleAlpha = 0.70
+		self.cfg.generatorScaleInterval = 2
+		self.cfg.generatorVerticalBias = 1.35
+		self.cfg.fakeAABlurEnabled = true
+		self.cfg.fakeAABlurStrength = 0.10
+		self.cfg.fakeAABlurThreshold = 0.07
+		self.cfg.fakeAABlurInterval = 2
 		self.cfg.edgeAAInterval = 2
 		self.cfg.glowEnabled = false
 		self.cfg.octaves = _max(3, _min(4, self.cfg.octaves))
@@ -1402,6 +1814,12 @@ function TopoShader:SetVisualProfile(profile)
 		self.cfg.edgeAAEnabled = false
 		self.cfg.lineAAEnabled = false
 		self.cfg.lineAAMode = "off"
+		self.cfg.analyticalAAEnabled = false
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.020
+		self.cfg.verticalAABoost = 0.45
+		self.cfg.generatorScaleEnabled = false
+		self.cfg.fakeAABlurEnabled = false
 		self.cfg.lineSharpness = 1.05
 		self.cfg.vignetteEnabled = false
 		self.cfg.vignetteStrength = 0.0
@@ -1411,6 +1829,21 @@ function TopoShader:SetVisualProfile(profile)
 		self.cfg.lineAAEnabled = true
 		self.cfg.lineAAStrength = 2.6
 		self.cfg.lineAAMode = "msaa4"
+		self.cfg.analyticalAAEnabled = true
+		self.cfg.analyticalAAStrength = 1.1
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.008
+		self.cfg.verticalAABoost = 1.10
+		self.cfg.generatorScaleEnabled = true
+		self.cfg.generatorScaleStrength = 0.58
+		self.cfg.generatorScaleThreshold = 0.05
+		self.cfg.generatorScaleAlpha = 0.86
+		self.cfg.generatorScaleInterval = 1
+		self.cfg.generatorVerticalBias = 1.50
+		self.cfg.fakeAABlurEnabled = true
+		self.cfg.fakeAABlurStrength = 0.16
+		self.cfg.fakeAABlurThreshold = 0.05
+		self.cfg.fakeAABlurInterval = 1
 		self.cfg.edgeAAInterval = 2
 		self.cfg.lineSharpness = 0.92
 		self.cfg.vignetteEnabled = true
@@ -1420,6 +1853,21 @@ function TopoShader:SetVisualProfile(profile)
 		self.cfg.lineAAEnabled = true
 		self.cfg.lineAAStrength = 2.0
 		self.cfg.lineAAMode = "fast"
+		self.cfg.analyticalAAEnabled = true
+		self.cfg.analyticalAAStrength = 0.85
+		self.cfg.adaptiveSamplingEnabled = true
+		self.cfg.aaEdgeThreshold = 0.012
+		self.cfg.verticalAABoost = 0.75
+		self.cfg.generatorScaleEnabled = true
+		self.cfg.generatorScaleStrength = 0.42
+		self.cfg.generatorScaleThreshold = 0.08
+		self.cfg.generatorScaleAlpha = 0.70
+		self.cfg.generatorScaleInterval = 2
+		self.cfg.generatorVerticalBias = 1.35
+		self.cfg.fakeAABlurEnabled = true
+		self.cfg.fakeAABlurStrength = 0.10
+		self.cfg.fakeAABlurThreshold = 0.07
+		self.cfg.fakeAABlurInterval = 2
 		self.cfg.vignetteEnabled = true
 		self.cfg.vignetteStrength = 0.10
 	end
@@ -1462,6 +1910,25 @@ function TopoShader:ApplyTheme(name)
 	return true
 end
 
+-- TopoActors folder may live:
+-- 1) under the TopoShader ModuleScript (original layout), or
+-- 2) next to it under the same parent (e.g. ShaderRunner Script contains both ModuleScript + TopoActors).
+local function findTopoActorsPool()
+	local pool = script:FindFirstChild("TopoActors")
+	if pool then return pool end
+	local p = script.Parent
+	if p then
+		pool = p:FindFirstChild("TopoActors")
+		if pool then return pool end
+		p = p.Parent
+		if p then
+			pool = p:FindFirstChild("TopoActors")
+			if pool then return pool end
+		end
+	end
+	return nil
+end
+
 function TopoShader:_refreshParallelState()
 	for _, c in ipairs(self._parallelConns) do
 		c:Disconnect()
@@ -1477,7 +1944,7 @@ function TopoShader:_refreshParallelState()
 		return
 	end
 
-	local pool = script:FindFirstChild("TopoActors")
+	local pool = findTopoActorsPool()
 	if not pool then
 		self._debugReport.parallelReady = false
 		self._debugReport.parallelWorkers = 0
@@ -1504,8 +1971,10 @@ function TopoShader:_refreshParallelState()
 	end
 
 	self._parallelWorkers = workers
-	self._parallelReady = protocolReady and workers >= _max(1, self.cfg.parallelWorkers or 1)
+	-- Any number of valid workers can be used (round-robin); do not require `parallelWorkers` separate Actor instances.
+	self._parallelReady = protocolReady and #self._parallelActors >= 1
 	if self._parallelReady then
+		self:_rebuildParallelTiles()
 		for _, w in ipairs(self._parallelActors) do
 			local conn = w.done.Event:Connect(function(result)
 				self:_onParallelChunkDone(result)
@@ -1514,7 +1983,7 @@ function TopoShader:_refreshParallelState()
 		end
 	end
 	self._debugReport.parallelReady = self._parallelReady
-	self._debugReport.parallelWorkers = workers
+	self._debugReport.parallelWorkers = #self._parallelActors
 end
 
 function TopoShader:SetParallelEnabled(enabled)
@@ -1721,11 +2190,18 @@ function TopoShader:_onParallelChunkDone(result)
 	if not data or rowStart == nil or rowEnd == nil then return end
 
 	local rW = self._rW
+	local colStart = result.colStart or 0
+	local colEnd = result.colEnd or (rW - 1)
 	local rows = rowEnd - rowStart + 1
-	local dstStart = rowStart * rW * 4
-	local count = rows * rW * 4
-	for i = 0, count - 1 do
-		buffer.writeu8(self._buf, dstStart + i, buffer.readu8(data, i))
+	local cols = colEnd - colStart + 1
+	local src = 0
+	for rr = 0, rows - 1 do
+		local dstBase = ((rowStart + rr) * rW + colStart) * 4
+		local count = cols * 4
+		for i = 0, count - 1 do
+			buffer.writeu8(self._buf, dstBase + i, buffer.readu8(data, src + i))
+		end
+		src += count
 	end
 
 	self._parallelPending -= 1
@@ -1735,37 +2211,74 @@ function TopoShader:_onParallelChunkDone(result)
 	end
 end
 
+function TopoShader:_rebuildParallelTiles()
+	self._parallelTiles = {}
+	self._parallelTileCursor = 1
+	local rW = self._rW
+	local rH = self._rH
+	local tw = _max(16, self.cfg.parallelTileWidth or 64)
+	local th = _max(16, self.cfg.parallelTileHeight or 64)
+	for row = 0, rH - 1, th do
+		local rowEnd = _min(rH - 1, row + th - 1)
+		for col = 0, rW - 1, tw do
+			local colEnd = _min(rW - 1, col + tw - 1)
+			table.insert(self._parallelTiles, {
+				rowStart = row,
+				rowEnd = rowEnd,
+				colStart = col,
+				colEnd = colEnd,
+			})
+		end
+	end
+end
+
 function TopoShader:_dispatchParallelFrame(t)
 	if not self._parallelReady then return false end
 	if self._parallelInFlight then return false end
 
-	local rH = self._rH
-	local chunkRows = _max(8, self.cfg.parallelChunkRows or 32)
 	local workers = self._parallelActors
 	if #workers == 0 then return false end
+	if #self._parallelTiles == 0 then
+		self:_rebuildParallelTiles()
+	end
 
 	self._parallelJobId += 1
 	self._parallelFrameTime = t
 	self._parallelPending = 0
 	self._parallelInFlight = true
 
-	local row = 0
+	local tiles = self._parallelTiles
+	local total = #tiles
+	local progressive = self.cfg.parallelProgressive
+	local budget = progressive and _max(1, self.cfg.parallelTilesPerFrame or 6) or total
 	local wi = 1
-	while row < rH do
-		local rowStart = row
-		local rowEnd = _min(rH - 1, row + chunkRows - 1)
+	for _ = 1, budget do
+		if total == 0 then break end
+		local ti = self._parallelTileCursor
+		if ti > total then ti = 1 end
+		local tile = tiles[ti]
+		self._parallelTileCursor = ti + 1
+		if self._parallelTileCursor > total then
+			self._parallelTileCursor = 1
+		end
+
 		local w = workers[wi]
 		self._parallelPending += 1
 		w.request:Fire({
 			jobId = self._parallelJobId,
-			rowStart = rowStart,
-			rowEnd = rowEnd,
+			rowStart = tile.rowStart,
+			rowEnd = tile.rowEnd,
+			colStart = tile.colStart,
+			colEnd = tile.colEnd,
 			rW = self._rW,
 			rH = self._rH,
 			time = t,
 			baseFrequency = self.cfg.baseFrequency,
 			contourLevels = self.cfg.contourLevels,
 			lineWidth = self.cfg.lineWidth,
+			softEdgesEnabled = self.cfg.softEdgesEnabled,
+			softEdgeWidth = self.cfg.softEdgeWidth,
+			softEdgeCurve = self.cfg.softEdgeCurve,
 			bgColor = self.cfg.bgColor,
 			lineColor = self.cfg.lineColor,
 			elevationTint = self.cfg.elevationTint,
@@ -1781,16 +2294,19 @@ function TopoShader:_dispatchParallelFrame(t)
 			ultraFastMode = self.cfg.ultraFastMode,
 			octaves = self.cfg.octaves,
 		})
-		row = rowEnd + 1
 		wi += 1
 		if wi > #workers then wi = 1 end
 	end
 
+	if self._parallelPending == 0 then
+		self._parallelInFlight = false
+		return false
+	end
 	return true
 end
 
 function TopoShader:GetTopoModes()
-	return { "classic", "godRays", "precision", "bold", "dream" }
+	return { "classic", "godRays", "precision", "bold", "dream", "wireframe", "molten", "glacier", "radar", "sunset" }
 end
 
 function TopoShader:ApplyFakeBackdropQuality(profile)

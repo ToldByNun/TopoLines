@@ -2,8 +2,10 @@
 -- Real worker implementation for Actor chunk rendering protocol.
 --
 -- Setup in Studio:
--- 1) Under your TopoShader ModuleScript, create Folder "TopoActors"
--- 2) Add N Actor instances in that folder (2-8 recommended)
+-- 1) Create Folder "TopoActors" either:
+--    - as a child of the TopoShader ModuleScript, OR
+--    - as a sibling next to TopoShader (e.g. both under the same LocalScript/Script)
+-- 2) Add N Actor instances in that folder (1+; round-robin used if fewer than parallelWorkers)
 -- 3) In each Actor, add:
 --    - BindableEvent named "RenderRequest"
 --    - BindableEvent named "RenderDone"
@@ -13,7 +15,7 @@
 -- - RenderRequest:Fire(payloadTable)
 -- - RenderDone:Fire(resultTable)
 -- Payload (required fields):
---   jobId, rowStart, rowEnd, rW, rH, time,
+--   jobId, rowStart, rowEnd, colStart, colEnd, rW, rH, time,
 --   baseFrequency, contourLevels, lineWidth,
 --   bgColor, lineColor, elevationTint, colorLow, colorHigh, tintAmount,
 --   animSpeed, animAngle,
@@ -45,6 +47,25 @@ end
 local function fade(t)
 	t = saturate(t)
 	return t * t * t * (t * (t * 6 - 15) + 10)
+end
+
+local function contourCoverage(h, levels, halfW, softEnabled, softWidth, softCurve)
+	local bandPos = (h * levels) % 1.0
+	local d = _min(bandPos, 1 - bandPos)
+	if not softEnabled then
+		return fade(1 - saturate(d / halfW))
+	end
+	local w = _max(0.0001, halfW)
+	local sw = _max(0, _min(1, softWidth or 0)) * w
+	local i0 = _max(0, w - sw)
+	local i1 = w + sw
+	local t = saturate((d - i0) / _max(0.0001, i1 - i0))
+	local cov = 1 - fade(t)
+	local c = _max(0.5, softCurve or 1)
+	if c ~= 1 then
+		cov = cov ^ c
+	end
+	return cov
 end
 
 local function fbm(x, y, z, oct, lac, per)
@@ -87,12 +108,15 @@ request.Event:Connect(function(p)
 
 	local rowStart = p.rowStart or 0
 	local rowEnd = p.rowEnd or -1
+	local colStart = p.colStart or 0
+	local colEnd = p.colEnd or ((p.rW or 1) - 1)
 	local rW = p.rW or 0
 	local rH = p.rH or 0
-	if rW <= 0 or rH <= 0 or rowEnd < rowStart then return end
+	if rW <= 0 or rH <= 0 or rowEnd < rowStart or colEnd < colStart then return end
 
 	local rows = rowEnd - rowStart + 1
-	local out = buffer.create(rows * rW * 4)
+	local cols = colEnd - colStart + 1
+	local out = buffer.create(rows * cols * 4)
 
 	local bg = p.bgColor or { r = 0, g = 0, b = 0, a = 1 }
 	local ln = p.lineColor or { r = 1, g = 1, b = 1, a = 1 }
@@ -101,6 +125,9 @@ request.Event:Connect(function(p)
 
 	local levels = p.contourLevels or 12
 	local halfW = (p.lineWidth or 0.06) * 0.5
+	local softEdgesEnabled = p.softEdgesEnabled
+	local softEdgeWidth = p.softEdgeWidth or 0.30
+	local softEdgeCurve = p.softEdgeCurve or 1.0
 	local doTint = p.elevationTint and true or false
 	local tintAmount = p.tintAmount or 0
 	local invTint = 1 - tintAmount
@@ -121,7 +148,7 @@ request.Event:Connect(function(p)
 	local outPi = 0
 	for row = rowStart, rowEnd do
 		local ny = row * baseFreq + driftY
-		for col = 0, rW - 1 do
+		for col = colStart, colEnd do
 			local nx = col * baseFreq + driftX
 			local h
 			if ultraFastMode then
@@ -132,28 +159,22 @@ request.Event:Connect(function(p)
 				h = heightField(nx, ny, zSlice, oct, lac, per, warp)
 			end
 
-			local bandPos = (h * levels) % 1.0
-			local d = _min(bandPos, 1 - bandPos)
-			local lineV = fade(1 - saturate(d / halfW))
+			local lineV = contourCoverage(h, levels, halfW, softEdgesEnabled, softEdgeWidth, softEdgeCurve)
 
-			local r, g, b, a
-			if lineV < 0.004 then
-				r, g, b, a = bg.r, bg.g, bg.b, bg.a
-			else
-				r, g, b = ln.r, ln.g, ln.b
-				if doTint then
-					local tr = lo.r + (hi.r - lo.r) * h
-					local tg = lo.g + (hi.g - lo.g) * h
-					local tb = lo.b + (hi.b - lo.b) * h
-					r = r * invTint + tr * tintAmount
-					g = g * invTint + tg * tintAmount
-					b = b * invTint + tb * tintAmount
-				end
-				r = bg.r + (r - bg.r) * lineV
-				g = bg.g + (g - bg.g) * lineV
-				b = bg.b + (b - bg.b) * lineV
-				a = bg.a + (ln.a - bg.a) * lineV
+			-- Analytical AA path: always blend continuously (no binary line threshold branch).
+			local r, g, b = ln.r, ln.g, ln.b
+			if doTint then
+				local tr = lo.r + (hi.r - lo.r) * h
+				local tg = lo.g + (hi.g - lo.g) * h
+				local tb = lo.b + (hi.b - lo.b) * h
+				r = r * invTint + tr * tintAmount
+				g = g * invTint + tg * tintAmount
+				b = b * invTint + tb * tintAmount
 			end
+			r = bg.r + (r - bg.r) * lineV
+			g = bg.g + (g - bg.g) * lineV
+			b = bg.b + (b - bg.b) * lineV
+			local a = bg.a + (ln.a - bg.a) * lineV
 
 			local i = outPi * 4
 			buffer.writeu8(out, i, _floor(saturate(r) * 255 + 0.5))
@@ -168,6 +189,8 @@ request.Event:Connect(function(p)
 		jobId = p.jobId,
 		rowStart = rowStart,
 		rowEnd = rowEnd,
+		colStart = colStart,
+		colEnd = colEnd,
 		data = out,
 	})
 end)

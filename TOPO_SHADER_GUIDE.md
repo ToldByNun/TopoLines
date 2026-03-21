@@ -35,6 +35,9 @@ shader:Configure({
     contourLevels = 14,
     lineWidth = 0.09,
     lineAAMode = "msaa4",
+    analyticalAAEnabled = true,
+    interlacedMode = "off",
+    upscaleMode = "bilinear",
     frameBudgetMs = 16,
 })
 ```
@@ -52,6 +55,8 @@ shader:Configure({
 - `SetMouseInteraction(radius, strength, enabledOptional)`
 - `ApplyTheme(name)`
 - `GetThemeNames()`
+- `ApplyTopoModeMorph(modeA, modeB, t, { strengthA?, strengthB?, applyTheme? })`
+- `SetTopoModeMorph(t, { strengthA?, strengthB?, applyTheme? })`
 - `ApplyFakeBackdropQuality("low" | "balanced" | "high")`
 - `ExportCurrentConfig()` (returns cloned current config table)
 - `ApplyConfigPreset(presetTable)` (safe bulk apply)
@@ -75,6 +80,25 @@ shader:Configure({
   - `cinematic`: smoother/softer with richer polish.
 
 Use both together: for example `qualityPreset="balanced"` + `visualProfile="cinematic"`.
+
+## Topo Mode Morphing
+
+You can morph between two topo modes with independent strengths, similar to layered shader blending.
+
+```lua
+shader:ApplyTopoModeMorph("classic", "precision", 0.35, {
+    strengthA = 1.0,
+    strengthB = 1.25,
+    applyTheme = true,
+})
+
+-- animate later:
+shader:SetTopoModeMorph(0.60)
+```
+
+- `t = 0` means fully mode A, `t = 1` means fully mode B.
+- `strengthA/strengthB` bias influence while morphing.
+- Numeric and color fields are interpolated; discrete mode flags pick the dominant side.
 
 ## Full Config Reference
 
@@ -145,6 +169,59 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
 - `lineAASubpixel`
   - **What**: subpixel offset size for `msaa4`.
   - **Higher**: stronger anti-aliasing, a bit softer.
+- `analyticalAAEnabled`
+  - **What**: explicit analytical contour widening based on local slope.
+  - **Use**: improves small-line stability without forcing full post-AA.
+- `analyticalAAStrength`
+  - **What**: amount of analytical widening.
+  - **Higher**: cleaner thin lines, but can look softer.
+- `softEdgesEnabled`
+  - **What**: writes smooth contour coverage into the buffer instead of hard edge transitions.
+- `softEdgeWidth`
+  - **What**: soft transition width relative to contour half-width.
+  - **Higher**: softer edge rolloff.
+- `softEdgeCurve`
+  - **What**: shaping curve for soft-edge falloff.
+  - **Higher**: crisper edge, lower: smoother edge.
+- `adaptiveSamplingEnabled`
+  - **What**: dynamic AA sampling budget per pixel.
+  - **Use**: reduces cost on simple/straight areas, keeps quality on important edges.
+- `aaEdgeThreshold`
+  - **What**: minimum local gradient before extra subpixel sampling runs.
+  - **Higher**: faster, less micro-detail AA.
+- `verticalAABoost`
+  - **What**: increases AA sampling spread on vertical-dominant edges.
+  - **Use**: cleaner verticals with less overall budget increase.
+- `generatorScaleEnabled`
+  - **What**: enables edge-aware reconstruction smoothing pass after main shading.
+  - **Why**: smoother upscale/jagged transitions without full blur look.
+- `generatorScaleStrength`
+  - **What**: blend amount of reconstructed neighbors.
+  - **Higher**: stronger smoothing.
+- `generatorScaleThreshold`
+  - **What**: edge sensitivity threshold for reconstruction.
+  - **Lower**: triggers on more edges/details.
+- `generatorScaleAlpha`
+  - **What**: alpha blending amount during generator scaling.
+  - **Higher**: softer transparency around line edges.
+- `generatorScaleInterval`
+  - **What**: run generator scaling every Nth frame.
+  - **Higher**: cheaper, slightly less consistent smoothing.
+- `generatorVerticalBias`
+  - **What**: prioritizes reconstruction strength for vertical-dominant edges.
+  - **Use**: keeps verticals cleaner while saving budget elsewhere.
+- `fakeAABlurEnabled`
+  - **What**: tiny edge-gated blur pass for perceptual anti-aliasing.
+  - **Use**: smooths residual shimmer/jaggies without full-scene blur.
+- `fakeAABlurStrength`
+  - **What**: blend amount of fake blur.
+  - **Higher**: smoother but can get soft quickly.
+- `fakeAABlurThreshold`
+  - **What**: edge sensitivity threshold for fake blur.
+  - **Lower**: affects more pixels.
+- `fakeAABlurInterval`
+  - **What**: run fake blur every Nth frame.
+  - **Higher**: lower cost.
 
 - `edgeAAEnabled`
   - **What**: post-process edge filter.
@@ -164,9 +241,18 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
 - `checkerboardReconstruction`
   - **What**: half-pixel rendering with reconstruction.
   - **Use carefully**: faster but can cause stipple on thin lines.
+- `interlacedMode`
+  - `off`: render full frame normally.
+  - `checkerboard`: interlaced checkerboard path (performance mode).
 - `temporalBlend`
   - **What**: blend with previous frame.
   - **Higher**: smoother shimmer, more ghosting risk.
+
+### Upscaling
+
+- `upscaleMode`
+  - `bilinear`: smoother upscale (recommended default).
+  - `nearest`: pixelated upscale for retro/debug look.
 
 ### Color / Styling
 
@@ -187,6 +273,21 @@ Use both together: for example `qualityPreset="balanced"` + `visualProfile="cine
   - **Enum**: `classic`, `ocean`, `neon`, `paper`
 - `topoModeAppliesTheme`
   - **What**: when true, `ApplyTopoMode` also maps to a matching theme for strong visual shifts.
+
+### Topographic Modes
+
+Built-in topo modes now include:
+
+- `classic`
+- `godRays`
+- `precision`
+- `bold`
+- `dream`
+- `wireframe`
+- `molten`
+- `glacier`
+- `radar`
+- `sunset`
 
 ### Interaction
 
@@ -247,6 +348,12 @@ The `showcases/` folder includes ready examples:
   - **What**: target shader update rate (not engine FPS).
 - `parallelEnabled`, `parallelWorkers`
   - **What**: Actor mode controls.
+- `parallelTileWidth`, `parallelTileHeight`
+  - **What**: worker tile size for tile-based rendering jobs.
+- `parallelProgressive`
+  - **What**: updates subset of tiles per frame for higher FPS.
+- `parallelTilesPerFrame`
+  - **What**: number of tiles dispatched each frame (progressive mode).
 - `fakeLocalBackdropEnabled`
   - **What**: enables ViewportFrame-based local backdrop blur workaround (panel-only).
 - `fakeLocalBackdropQuality`
@@ -358,6 +465,8 @@ shader:ApplyFakeBackdropQuality("high")
 - `P`: pause/resume
 - `[ / ]`: contour levels down/up
 - `1 / 2 / 3`: quality preset (locks adaptive off)
+- `4 / 5`: topo mode morph `t` down/up
+- `6`: cycle morph target mode B
 - `7 / 8 / 9`: visual profile
 - `T`: cycle theme
 - `Y`: cycle fake local backdrop quality (`low/balanced/high`)
@@ -369,13 +478,18 @@ shader:ApplyFakeBackdropQuality("high")
 - `V`: vignette on/off
 - `B`: line AA toggle
 - `U`: line AA mode cycle (`off/fast/msaa4`)
+- `L`: analytical AA toggle
+- `Q`: upscale mode cycle (`bilinear/nearest`)
+- `\`: interlaced mode cycle (`off/checkerboard`)
 - `N`: edge AA quality cycle (`fast/hq`)
+- `Z`: generator scaling toggle
 - `K`: adaptive quality toggle
 - `0`: force adaptive quality on
 - `F8`: debug overlay
 - `F9`: print debug report
 - `F10`: parallel mode toggle
 - `F6`: auto-tune best settings
+- `I / O`: tiles-per-frame down/up (parallel progressive tuning)
 - `H`: key help
 - `J`: config schema/template help
 
@@ -383,11 +497,22 @@ shader:ApplyFakeBackdropQuality("high")
 
 Current shader uses safe fallback if actor pool is missing or incomplete.
 
-Required hierarchy:
+**Where to put `TopoActors` (important):**
 
-1. Under `TopoShader` ModuleScript, create folder: `TopoActors`
-2. Add multiple `Actor` children (2-8 typical)
-3. Inside each `Actor`, add:
+The module looks for a folder named `TopoActors` in this order:
+
+1. Under the **`TopoShader` ModuleScript** (original layout), or  
+2. Under the **parent** of `TopoShader` (typical: your runner script contains both `TopoShader` and `TopoActors`), or  
+3. Under that parent’s parent (e.g. `ScreenGui`).
+
+So this **does** work: `ScreenGui` → `ShaderRunner` → `TopoActors` + `TopoShader` as siblings.
+
+`Actor` is a normal `Instance` and can be parented under UI hierarchies; parallel workers still run as long as the worker script is inside an `Actor` with the bindables above.
+
+**Inside `TopoActors`:**
+
+1. Add one or more `Actor` children (one is enough; extra actors are used in round-robin).
+2. Inside each `Actor`, add:
    - `BindableEvent` named `RenderRequest`
    - `BindableEvent` named `RenderDone`
    - Script with source from `TopoActorWorker.luau`
@@ -397,7 +522,7 @@ Then:
 ```lua
 shader:Configure({
     parallelEnabled = true,
-    parallelWorkers = 4,
+    parallelWorkers = 4, -- desired; fewer physical Actors still work
 })
 ```
 

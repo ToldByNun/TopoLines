@@ -9,9 +9,10 @@ local shader = TopoShader.new(script.Parent, {
 	width        = 460,
 	height       = 300,
 
-	-- Low-cost base resolution (for stable 60fps)
-	renderWidth  = 184,
-	renderHeight = 120,
+	-- Ultra-low runtime baseline (stabilize frame time first)
+	renderWidth  = 148,
+	renderHeight = 96,
+	upscaleMode  = "bilinear",
 
 	-- ── The critical number: LOW frequency = smooth hills ──────
 	-- (renderWidth × baseFrequency) should be ~1.5 to 3.0
@@ -19,8 +20,8 @@ local shader = TopoShader.new(script.Parent, {
 	baseFrequency = 0.008,
 
 	-- Contours
-	contourLevels = 10,
-	lineWidth     = 0.115,
+	contourLevels = 8,
+	lineWidth     = 0.13,
 
 	-- Noise character
 	octaves     = 4,
@@ -29,20 +30,36 @@ local shader = TopoShader.new(script.Parent, {
 	warpAmount  = 1.0,
 	fastMode    = true,
 	ultraFastMode = true,
-	checkerboardReconstruction = false,
-	temporalBlend = 0.12,
+	checkerboardReconstruction = true,
+	interlacedMode = "checkerboard",
+	temporalBlend = 0.18,
 	edgeAAEnabled   = false,
-	edgeAAStrength  = 0.42,
+	edgeAAStrength  = 0.40,
 	edgeAAThreshold = 16,
 	edgeAAInterval  = 3,
 	edgeAAQuality   = "hq",
 	lineAAEnabled   = false,
-	lineAAStrength  = 1.8,
+	lineAAStrength  = 1.7,
 	lineAAStep      = 0.55,
 	lineAAMode      = "off",
-	lineAASubpixel  = 0.30,
+	lineAASubpixel  = 0.32,
+	analyticalAAEnabled = false,
+	analyticalAAStrength = 0.80,
+	adaptiveSamplingEnabled = false,
+	aaEdgeThreshold = 0.014,
+	verticalAABoost = 0.85,
+	generatorScaleEnabled = false,
+	generatorScaleStrength = 0.24,
+	generatorScaleThreshold = 0.07,
+	generatorScaleAlpha = 0.68,
+	generatorScaleInterval = 4,
+	generatorVerticalBias = 1.40,
+	fakeAABlurEnabled = false,
+	fakeAABlurStrength = 0.06,
+	fakeAABlurThreshold = 0.09,
+	fakeAABlurInterval = 2,
 	qualityPreset   = "balanced",
-	adaptiveQuality = false,
+	adaptiveQuality = true,
 	frameBudgetMs   = 16.6,
 	debugEnabled    = true,
 	debugUpdateRate = 0.25,
@@ -52,6 +69,10 @@ local shader = TopoShader.new(script.Parent, {
 	lineSharpness   = 0.88,
 	parallelEnabled = false,
 	parallelWorkers = 4,
+	parallelTileWidth = 64,
+	parallelTileHeight = 64,
+	parallelProgressive = true,
+	parallelTilesPerFrame = 6,
 	theme = "classic",
 	topoMode = "classic",
 
@@ -90,7 +111,7 @@ local shader = TopoShader.new(script.Parent, {
 	localBlurSize = 24,
 	backgroundBlurEnabled = false,
 	backgroundBlurSize = 10,
-	fakeLocalBackdropEnabled = true,
+	fakeLocalBackdropEnabled = false,
 	fakeLocalBackdropAlpha = 0.28,
 	fakeLocalBackdropRefreshHz = 12,
 	fakeLocalBackdropQuality = "balanced",
@@ -109,13 +130,25 @@ shader:SetAnchor(Vector2.new(0.5, 0.5))
 shader:ApplyTheme("classic")
 shader:SetQualityPreset("performance")
 shader:SetVisualProfile("performance")
-shader:ApplyTopoMode("bold")
+shader:ApplyTopoMode("classic")
 shader:Configure({
-	adaptiveQuality = false,
+	adaptiveQuality = true,
 	lineAAMode = "off",
+	lineAAEnabled = false,
+	analyticalAAEnabled = false,
 	edgeAAEnabled = false,
 	edgeAAQuality = "hq",
+	softEdgesEnabled = true,
+	softEdgeWidth = 0.28,
+	generatorScaleEnabled = false,
+	fakeAABlurEnabled = false,
+	checkerboardReconstruction = true,
+	interlacedMode = "checkerboard",
+	temporalBlend = 0.18,
 	mouseEnabled = false,
+	fakeLocalBackdropEnabled = false,
+	backgroundBlurEnabled = false,
+	localBlurEnabled = false,
 })
 shader:Start()
 
@@ -127,12 +160,17 @@ local backdropQualities = { "low", "balanced", "high" }
 local themeIdx = 1
 local topoIdx = 1
 local backdropIdx = 2
+local morphA = "classic"
+local morphB = "precision"
+local morphT = 0.0
+local morphEnabled = false
 for i, m in ipairs(topoModes) do
 	if m == shader.cfg.topoMode then
 		topoIdx = i
 		break
 	end
 end
+
 local function keyName(inp)
 	return inp.KeyCode and inp.KeyCode.Name or ""
 end
@@ -156,6 +194,38 @@ UIS.InputBegan:Connect(function(inp, gp)
 		shader:SetQualityPreset("performance")
 		shader:Configure({ adaptiveQuality = false })
 		print("[TopoShader] preset=performance (adaptive off)")
+	end
+	-- 4/5 = topo mode morph t down/up
+	if k == "Four" then
+		if not morphEnabled then
+			morphEnabled = true
+			shader:ApplyTopoModeMorph(morphA, morphB, morphT, { strengthA = 1.0, strengthB = 1.0, applyTheme = true })
+		end
+		morphT = math.max(0, morphT - 0.05)
+		shader:SetTopoModeMorph(morphT)
+		print(string.format("[TopoShader] morph %s -> %s | t=%.2f", morphA, morphB, morphT))
+	end
+	if k == "Five" then
+		if not morphEnabled then
+			morphEnabled = true
+			shader:ApplyTopoModeMorph(morphA, morphB, morphT, { strengthA = 1.0, strengthB = 1.0, applyTheme = true })
+		end
+		morphT = math.min(1, morphT + 0.05)
+		shader:SetTopoModeMorph(morphT)
+		print(string.format("[TopoShader] morph %s -> %s | t=%.2f", morphA, morphB, morphT))
+	end
+	-- 6 = cycle morph target mode B
+	if k == "Six" then
+		local bi = 1
+		for i, m in ipairs(topoModes) do
+			if m == morphB then bi = i break end
+		end
+		bi += 1
+		if bi > #topoModes then bi = 1 end
+		morphB = topoModes[bi]
+		morphEnabled = true
+		shader:ApplyTopoModeMorph(morphA, morphB, morphT, { strengthA = 1.0, strengthB = 1.0, applyTheme = true })
+		print(string.format("[TopoShader] morph target B=%s (A=%s, t=%.2f)", morphB, morphA, morphT))
 	end
 	if k == "Two" then
 		shader:SetQualityPreset("balanced")
@@ -199,6 +269,15 @@ UIS.InputBegan:Connect(function(inp, gp)
 	if k == "F10" then
 		shader:SetParallelEnabled(not shader.cfg.parallelEnabled)
 		print("[TopoShader] parallelEnabled =", shader.cfg.parallelEnabled)
+	end
+	-- I / O = progressive tiles per frame down / up
+	if k == "I" then
+		shader:Configure({ parallelTilesPerFrame = math.max(1, (shader.cfg.parallelTilesPerFrame or 6) - 1) })
+		print("[TopoShader] parallelTilesPerFrame =", shader.cfg.parallelTilesPerFrame)
+	end
+	if k == "O" then
+		shader:Configure({ parallelTilesPerFrame = math.min(128, (shader.cfg.parallelTilesPerFrame or 6) + 1) })
+		print("[TopoShader] parallelTilesPerFrame =", shader.cfg.parallelTilesPerFrame)
 	end
 	-- F6 = auto tune best settings for hardware
 	if k == "F6" then
@@ -251,11 +330,33 @@ UIS.InputBegan:Connect(function(inp, gp)
 		shader:Configure({ lineAAMode = mode, lineAAEnabled = (mode ~= "off") })
 		print("[TopoShader] lineAAMode =", mode)
 	end
+	-- L = toggle analytical AA
+	if k == "L" then
+		shader:Configure({ analyticalAAEnabled = not shader.cfg.analyticalAAEnabled })
+		print("[TopoShader] analyticalAAEnabled =", shader.cfg.analyticalAAEnabled)
+	end
+	-- P = cycle interlaced mode (off/checkerboard)
+	if k == "BackSlash" then
+		local im = (shader.cfg.interlacedMode == "checkerboard") and "off" or "checkerboard"
+		shader:Configure({ interlacedMode = im })
+		print("[TopoShader] interlacedMode =", im)
+	end
+	-- Q = toggle upscale mode (bilinear/nearest)
+	if k == "Q" then
+		local um = (shader.cfg.upscaleMode == "nearest") and "bilinear" or "nearest"
+		shader:Configure({ upscaleMode = um })
+		print("[TopoShader] upscaleMode =", um)
+	end
 	-- N = cycle edge AA quality (fast/hq)
 	if k == "N" then
 		local q = (shader.cfg.edgeAAQuality == "hq") and "fast" or "hq"
 		shader:Configure({ edgeAAQuality = q, edgeAAEnabled = true })
 		print("[TopoShader] edgeAAQuality =", q)
+	end
+	-- Z = toggle generator scaling filter
+	if k == "Z" then
+		shader:Configure({ generatorScaleEnabled = not shader.cfg.generatorScaleEnabled })
+		print("[TopoShader] generatorScaleEnabled =", shader.cfg.generatorScaleEnabled)
 	end
 	-- T = cycle theme packs
 	if k == "T" then
@@ -274,16 +375,18 @@ UIS.InputBegan:Connect(function(inp, gp)
 		print("[TopoShader] fakeBackdropQuality =", q)
 	end
 	-- G = cycle topo modes
-	if k == "G" or k == "R" then
+	if k == "G" then
 		topoIdx += 1
 		if topoIdx > #topoModes then topoIdx = 1 end
 		local m = topoModes[topoIdx]
 		shader:ApplyTopoMode(m)
+		morphEnabled = false
+		morphA = m
 		print("[TopoShader] topoMode =", m, "theme =", shader.cfg.theme)
 	end
 	-- H = print keybind help
 	if k == "H" then
-		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 7/8/9 visuals | T theme | G topo mode | Y fake backdrop quality | M mouse | X cursor dither | C dither pattern | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | N edgeAA quality | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel")
+		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 4/5 morph t | 6 morph target B | 7/8/9 visuals | T theme | G topo mode(A) | Y fake backdrop quality | M mouse | X cursor dither | C dither pattern | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | L analyticalAA | Q upscale mode | \\ interlaced mode | N edgeAA quality | Z generator scaling | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel | I/O tiles/frame")
 	end
 	-- J = print schema/template helpers for customization
 	if k == "J" then
