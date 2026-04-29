@@ -149,6 +149,20 @@ local DEFAULTS = {
 	fakeLocalBackdropPanelMargin = 48, -- pixel margin around panel bounds
 	fakeLocalBackdropBlurStrength = 0.65, -- 0..1 stronger frosted blur simulation
 	topoModeAppliesTheme = true, -- make topo mode switches visibly distinct
+
+	-- ── Pre-Cached Loop Playback ──────────────────────────────────
+	-- Bake a finite seamless loop once at startup, then play it back
+	-- at zero CPU cost by cycling through pre-rendered buffers.
+	cacheEnabled        = false,  -- master toggle; false = classic live render path
+	loopDuration        = 4.0,    -- seconds for one complete seamless loop
+	loopFPS             = 24,     -- frames baked per second (24 = smooth, 30 = smoother)
+	loopAmplitude       = 0.15,   -- noise-space travel magnitude over the loop
+	loopZAmplitude      = 0.08,   -- z-slice oscillation magnitude
+	bakeOnStart         = true,   -- auto-bake when Start() is called
+	bakeUseParallel     = true,   -- use Actor workers during bake if available
+	mouseOverlayInCache = true,   -- recompute mouse-warp area live on top of cached frame
+	onBakeProgress      = nil,    -- callback(doneFrames, totalFrames) — fired each baked frame
+	onBakeComplete      = nil,    -- callback() — fired when bake finishes
 }
 
 -- Beginner-safe config schema. Values are clamped/sanitized on write.
@@ -254,6 +268,34 @@ local CONFIG_RULES = {
 	fakeLocalBackdropPanelMargin = { t = "number", min = 0, max = 256, integer = true },
 	fakeLocalBackdropBlurStrength = { t = "number", min = 0, max = 1 },
 	topoModeAppliesTheme = { t = "boolean" },
+	-- Pre-cached loop playback
+	cacheEnabled        = { t = "boolean" },
+	loopDuration        = { t = "number", min = 0.5, max = 60 },
+	loopFPS             = { t = "number", min = 1, max = 60, integer = true },
+	loopAmplitude       = { t = "number", min = 0, max = 2.0 },
+	loopZAmplitude      = { t = "number", min = 0, max = 1.0 },
+	bakeOnStart         = { t = "boolean" },
+	bakeUseParallel     = { t = "boolean" },
+	mouseOverlayInCache = { t = "boolean" },
+}
+
+-- Keys that require a full rebake when changed while cacheEnabled = true.
+local CACHE_INVALIDATE_KEYS = {
+	contourLevels=true, lineWidth=true, lineSharpness=true, baseFrequency=true,
+	octaves=true, lacunarity=true, persistence=true, warpAmount=true,
+	fastMode=true, ultraFastMode=true,
+	elevationTint=true, tintAmount=true,
+	softEdgesEnabled=true, softEdgeWidth=true, softEdgeCurve=true,
+	loopDuration=true, loopFPS=true, loopAmplitude=true, loopZAmplitude=true,
+	animAngle=true,
+	lineAAEnabled=true, lineAAMode=true, lineAAStrength=true,
+	lineAAStep=true, lineAASubpixel=true,
+	analyticalAAEnabled=true, analyticalAAStrength=true,
+	edgeAAEnabled=true, edgeAAQuality=true, edgeAAStrength=true, edgeAAThreshold=true,
+	generatorScaleEnabled=true, generatorScaleStrength=true,
+	glowEnabled=true, glowStrength=true,
+	vignetteEnabled=true, vignetteStrength=true,
+	bgColor=true, lineColor=true, colorLow=true, colorHigh=true,
 }
 
 local THEMES = {
@@ -641,6 +683,10 @@ function TopoShader.new(parentGui, userConfig)
 		parallelWorkers = 0,
 		localBlurReady = false,
 		fakeBackdropReady = false,
+		-- cache fields
+		cacheReady = false,
+		bakeProgress = 0,
+		bakeTotalFrames = 0,
 	}
 	self._parallelReady = false
 	self._parallelWorkers = 0
@@ -655,6 +701,18 @@ function TopoShader.new(parentGui, userConfig)
 	self._parallelTiles = {}
 	self._parallelTileCursor = 1
 	self._autoTune = nil
+
+	-- Pre-cached loop playback state
+	self._bakeOverride        = nil   -- {driftX,driftY,zSlice} — set during _bakeFrameSerial
+	self._cache               = {}    -- array[i] = full RGBA buffer for baked frame i
+	self._cacheIdx            = 1     -- current playback frame index
+	self._cacheReady          = false
+	self._bakeActive          = false
+	self._bakeFI              = 0     -- next frame index to bake (0-based)
+	self._bakeTotalFrames     = 0
+	self._bakeParallelWaiting = false
+	self._playBuf             = nil   -- writable scratch copy: cached frame + overlay
+	self._cacheAccum          = 0     -- time accumulator for cache frame rate
 
 	-- Pre-bake noise-space XY per pixel
 	-- This is the critical fix: frequency must be low
@@ -1223,9 +1281,300 @@ function TopoShader:_applyFakeAABlur()
 end
 
 -- ================================================================
+--  PRE-CACHED LOOP PLAYBACK
+-- ================================================================
+
+-- Begin a fresh bake. Allocates state; actual rendering happens via _stepBakeTick().
+function TopoShader:_startBake()
+	local cfg = self.cfg
+	local totalFrames = _max(1, _floor((cfg.loopFPS or 24) * (cfg.loopDuration or 4.0) + 0.5))
+	self._cache               = {}
+	self._cacheIdx            = 1
+	self._cacheReady          = false
+	self._bakeActive          = true
+	self._bakeFI              = 0
+	self._bakeTotalFrames     = totalFrames
+	self._bakeParallelWaiting = false
+	self._cacheAccum          = 0
+	self._playBuf             = buffer.create(self._pixCount * 4)
+	self._debugReport.cacheReady    = false
+	self._debugReport.bakeProgress  = 0
+	self._debugReport.bakeTotalFrames = totalFrames
+end
+
+-- Copy the current _buf into a fresh buffer and store it as the next cached frame.
+function TopoShader:_storeBakeFrame()
+	local n   = self._pixCount * 4
+	local src = self._buf
+	local frame = buffer.create(n)
+	for i = 0, n - 1 do
+		buffer.writeu8(frame, i, buffer.readu8(src, i))
+	end
+	self._cache[self._bakeFI + 1] = frame
+end
+
+-- Render one bake frame using provided drift values (serial path only).
+-- Result lands in _buf; EditableImage upload is intentionally skipped.
+function TopoShader:_bakeFrameSerial(driftX, driftY, zSlice)
+	self._bakeOverride = { driftX = driftX, driftY = driftY, zSlice = zSlice }
+	-- Force serial path and clean settings for a full-quality, non-interlaced frame.
+	local savedParallel  = self.cfg.parallelEnabled
+	local savedChecker   = self.cfg.checkerboardReconstruction
+	local savedTemporal  = self.cfg.temporalBlend
+	self.cfg.parallelEnabled            = false
+	self.cfg.checkerboardReconstruction = false
+	self.cfg.temporalBlend              = 0
+	self:_render(0)
+	self.cfg.parallelEnabled            = savedParallel
+	self.cfg.checkerboardReconstruction = savedChecker
+	self.cfg.temporalBlend              = savedTemporal
+	self._bakeOverride = nil
+end
+
+-- Called once per RenderStepped tick while a bake is active.
+-- Renders one frame (serial or parallel) and stores it when complete.
+function TopoShader:_stepBakeTick()
+	local cfg   = self.cfg
+	local fi    = self._bakeFI
+	local total = self._bakeTotalFrames
+
+	-- Bake complete?
+	if fi >= total then
+		self._bakeActive = false
+		self._cacheReady = true
+		self._debugReport.cacheReady   = true
+		self._debugReport.bakeProgress = 1
+		if type(cfg.onBakeComplete) == "function" then
+			pcall(cfg.onBakeComplete)
+		end
+		return
+	end
+
+	-- Waiting for async parallel workers to finish the current frame.
+	if self._bakeParallelWaiting then
+		if self._parallelFrameReady then
+			-- Apply the same post-processing passes as the parallel live path.
+			if cfg.glowEnabled then self:_applyGlow() end
+			if cfg.edgeAAEnabled then self:_applyEdgeAA() end
+			if cfg.generatorScaleEnabled then self:_applyGeneratorScale() end
+			if cfg.fakeAABlurEnabled then self:_applyFakeAABlur() end
+			self:_storeBakeFrame()
+			self._parallelFrameReady   = false
+			self._parallelInFlight     = false
+			self._bakeParallelWaiting  = false
+			self._bakeFI              += 1
+			self._debugReport.bakeProgress = self._bakeFI / total
+			if type(cfg.onBakeProgress) == "function" then
+				pcall(cfg.onBakeProgress, self._bakeFI, total)
+			end
+		end
+		-- Don't dispatch another frame until this one is collected.
+		return
+	end
+
+	-- Compute sinusoidal loop phase for this frame.
+	-- phase sweeps 0 → 2π over the full loop, guaranteeing frame[0] == frame[N].
+	local phase   = (fi / total) * 2 * math.pi
+	local loopAmp = cfg.loopAmplitude  or 0.15
+	local loopZ   = cfg.loopZAmplitude or 0.08
+	local driftX  = _cos(cfg.animAngle or 0.45) * loopAmp *  _sin(phase)
+	local driftY  = _sin(cfg.animAngle or 0.45) * loopAmp * (-_cos(phase))
+	local zSlice  = loopZ * _sin(phase + math.pi * 0.5)
+
+	-- Try parallel bake first.
+	if self._parallelReady and cfg.bakeUseParallel and cfg.parallelEnabled then
+		local ok = self:_dispatchParallelFrame(
+			0, { driftX = driftX, driftY = driftY, zSlice = zSlice }
+		)
+		if ok then
+			self._bakeParallelWaiting = true
+			return
+		end
+	end
+
+	-- Serial fallback: render directly on the main thread.
+	self:_bakeFrameSerial(driftX, driftY, zSlice)
+	self:_storeBakeFrame()
+	self._bakeFI += 1
+	self._debugReport.bakeProgress = self._bakeFI / total
+	if type(cfg.onBakeProgress) == "function" then
+		pcall(cfg.onBakeProgress, self._bakeFI, total)
+	end
+end
+
+-- Zero-cost playback: advance cache frame index at loopFPS rate, write to EditableImage.
+function TopoShader:_playbackTick(dt)
+	if not self._cacheReady then return end
+	local total = self._bakeTotalFrames
+	if total <= 0 then return end
+
+	-- Advance at loopFPS rate independent of cfg.fps.
+	self._cacheAccum += (dt or (1 / _max(1, self.cfg.fps or 60)))
+	local cacheInv = 1 / _max(1, self.cfg.loopFPS or 24)
+	while self._cacheAccum >= cacheInv do
+		self._cacheAccum -= cacheInv
+		self._cacheIdx = (self._cacheIdx % total) + 1
+	end
+
+	local frame = self._cache[self._cacheIdx]
+	if not frame then return end
+
+	-- Copy cached frame into the writable play buffer.
+	local playBuf = self._playBuf
+	local n = self._pixCount * 4
+	for i = 0, n - 1 do
+		buffer.writeu8(playBuf, i, buffer.readu8(frame, i))
+	end
+
+	-- Optional live mouse overlay (only pixels inside mouse radius are recomputed).
+	if self.cfg.mouseOverlayInCache and self.cfg.mouseEnabled
+			and (self.cfg.mouseStrength or 0) > 0
+			and (self.cfg.mouseRadius  or 0) > 0 then
+		self:_applyMouseOverlayPatch(playBuf)
+	end
+
+	self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), playBuf)
+end
+
+-- Recompute only the pixels within mouseRadius of the cursor and patch playBuf.
+-- Cost is O(mouseRadius²) in render-space, not O(rW*rH).
+function TopoShader:_applyMouseOverlayPatch(playBuf)
+	local cfg     = self.cfg
+	local rW      = self._rW
+	local rH      = self._rH
+	local total   = self._bakeTotalFrames
+	local fi      = self._cacheIdx - 1   -- 0-based frame index
+
+	-- Reconstruct the exact drift used for this cached frame.
+	local phase   = (fi / _max(1, total)) * 2 * math.pi
+	local loopAmp = cfg.loopAmplitude  or 0.15
+	local loopZ   = cfg.loopZAmplitude or 0.08
+	local driftX  = _cos(cfg.animAngle or 0.45) * loopAmp *  _sin(phase)
+	local driftY  = _sin(cfg.animAngle or 0.45) * loopAmp * (-_cos(phase))
+	local zSlice  = loopZ * _sin(phase + math.pi * 0.5)
+
+	local mX     = self._mouseX
+	local mY     = self._mouseY
+	local mRad   = cfg.mouseRadius or 120
+	local mRadSq = mRad * mRad
+	local mStr   = (cfg.mouseStrength or 0.35) * (cfg.baseFrequency or 0.008) * 10
+	local scaleX = self._scaleX
+	local scaleY = self._scaleY
+
+	-- Restrict to the bounding box of the mouse circle in render space.
+	local mRX   = mX / scaleX
+	local mRY   = mY / scaleY
+	local mRRad = mRad / _min(scaleX, scaleY)
+	local rowMin = _max(0,      _floor(mRY - mRRad))
+	local rowMax = _min(rH - 1, _floor(mRY + mRRad))
+	local colMin = _max(0,      _floor(mRX - mRRad))
+	local colMax = _min(rW - 1, _floor(mRX + mRRad))
+
+	local levels     = cfg.contourLevels
+	local halfW      = (cfg.lineWidth or 0.06) * 0.5
+	local softEn     = cfg.softEdgesEnabled
+	local softWidth  = cfg.softEdgeWidth or 0.30
+	local softCurve  = cfg.softEdgeCurve or 1.0
+	local bgR = cfg.bgColor.r;   local bgG = cfg.bgColor.g
+	local bgB = cfg.bgColor.b;   local bgA = cfg.bgColor.a
+	local lnR = cfg.lineColor.r; local lnG = cfg.lineColor.g
+	local lnB = cfg.lineColor.b; local lnA = cfg.lineColor.a
+	local doTint  = cfg.elevationTint
+	local tintAmt = cfg.tintAmount or 0
+	local invTint = 1 - tintAmt
+	local loR = cfg.colorLow.r;  local loG = cfg.colorLow.g;  local loB = cfg.colorLow.b
+	local hiR = cfg.colorHigh.r; local hiG = cfg.colorHigh.g; local hiB = cfg.colorHigh.b
+	local oct = cfg.octaves; local lac = cfg.lacunarity
+	local per = cfg.persistence; local warp = cfg.warpAmount
+	local fastMode  = cfg.fastMode; local ultraFast = cfg.ultraFastMode
+	local outputOpacity = cfg.outputOpacity or 1.0
+	local vigEn  = cfg.vignetteEnabled
+	local vigStr = cfg.vignetteStrength or 0
+	local vig    = self._vig
+	local cX = self._cX; local cY = self._cY
+	local pX = self._pX; local pY = self._pY
+
+	for row = rowMin, rowMax do
+		for col = colMin, colMax do
+			local pi  = row * rW + col + 1
+			local dx  = pX[pi] - mX
+			local dy  = pY[pi] - mY
+			local dSq = dx * dx + dy * dy
+			if dSq < mRadSq then
+				local nx   = cX[pi] + driftX
+				local ny   = cY[pi] + driftY
+				local dist = _sqrt(dSq) + 0.0001
+				local fall = 1 - dist / mRad
+				fall = fall * fall * (3 - 2 * fall)
+				local push = fall * mStr
+				nx = nx - (dx / dist) * push
+				ny = ny - (dy / dist) * push
+				local h
+				if ultraFast then
+					h = heightFieldUltra(nx, ny, zSlice, lac, per, warp)
+				elseif fastMode then
+					h = heightFieldFast(nx, ny, zSlice, oct, lac, per, warp)
+				else
+					h = heightField(nx, ny, zSlice, oct, lac, per, warp)
+				end
+				local lineV = contourValue(h, levels, halfW, softEn, softWidth, softCurve)
+				local r, g, b = lnR, lnG, lnB
+				if doTint then
+					local tr = loR + (hiR - loR) * h
+					local tg = loG + (hiG - loG) * h
+					local tb = loB + (hiB - loB) * h
+					r = r * invTint + tr * tintAmt
+					g = g * invTint + tg * tintAmt
+					b = b * invTint + tb * tintAmt
+				end
+				r = bgR + (r - bgR) * lineV
+				g = bgG + (g - bgG) * lineV
+				b = bgB + (b - bgB) * lineV
+				local a = bgA + (lnA - bgA) * lineV
+				local ur = _floor(saturate(r) * 255 + 0.5)
+				local ug = _floor(saturate(g) * 255 + 0.5)
+				local ub = _floor(saturate(b) * 255 + 0.5)
+				local ua = _floor(saturate(a * outputOpacity) * 255 + 0.5)
+				if vigEn and vigStr > 0 then
+					local vf = 1 - (1 - vig[pi]) * vigStr
+					ur = _floor(ur * vf + 0.5)
+					ug = _floor(ug * vf + 0.5)
+					ub = _floor(ub * vf + 0.5)
+				end
+				local idx = (pi - 1) * 4
+				buffer.writeu8(playBuf, idx,     ur)
+				buffer.writeu8(playBuf, idx + 1, ug)
+				buffer.writeu8(playBuf, idx + 2, ub)
+				buffer.writeu8(playBuf, idx + 3, ua)
+			end
+		end
+	end
+end
+
+-- Public API: manually trigger a fresh bake (e.g. after config changes).
+-- Start() must have been called first so the RenderStepped loop is running.
+function TopoShader:Rebake()
+	if not self.cfg.cacheEnabled then
+		return false, "cacheEnabled is false — enable it first"
+	end
+	if self._bakeActive then
+		return false, "bake already in progress"
+	end
+	self:_startBake()
+	return true
+end
+
+-- ================================================================
 --  RENDER FRAME
 -- ================================================================
 function TopoShader:_render(t)
+	-- Pre-cached loop playback: if cache is ready just display the baked frame.
+	if self.cfg.cacheEnabled and self._cacheReady and not self._bakeOverride then
+		self:_playbackTick(1 / _max(1, self.cfg.fps or 60))
+		self:_updateDebug(0.05)
+		return
+	end
+
 	if self._parallelReady and self.cfg.parallelEnabled then
 		local renderStart = os.clock()
 		if not self._parallelInFlight then
@@ -1316,12 +1665,14 @@ function TopoShader:_render(t)
 	local aaEdgeThreshold = cfg.aaEdgeThreshold or 0.012
 	local verticalAABoost = cfg.verticalAABoost or 0.75
 
-	-- Animate: drift the whole noise field slowly
-	local driftX = _cos(cfg.animAngle) * cfg.animSpeed * t
-	local driftY = _sin(cfg.animAngle) * cfg.animSpeed * t
+	-- Animate: drift the whole noise field slowly.
+	-- _bakeOverride replaces these with sinusoidal loop values during baking.
+	local _bo    = self._bakeOverride
+	local driftX = _bo and _bo.driftX or (_cos(cfg.animAngle) * cfg.animSpeed * t)
+	local driftY = _bo and _bo.driftY or (_sin(cfg.animAngle) * cfg.animSpeed * t)
 
 	-- Slow morph (z-axis of noise)
-	local zSlice = t * 0.12
+	local zSlice = _bo and _bo.zSlice or (t * 0.12)
 
 	-- Mouse warp
 	local mX       = self._mouseX
@@ -1532,16 +1883,21 @@ function TopoShader:_render(t)
 		self:_applyFakeAABlur()
 	end
 
-	-- Single GPU upload — the entire buffer in one call
-	self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(rW, rH), buf)
-	self._checkerPhase = 1 - phase
-	self._frameId += 1
+	-- Single GPU upload — skip when this call is from _bakeFrameSerial
+	-- (caller handles display and buffer storage in that case).
+	if not self._bakeOverride then
+		self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(rW, rH), buf)
+		self._checkerPhase = 1 - phase
+		self._frameId += 1
+	end
 
 	local renderMs = (os.clock() - renderStart) * 1000
-	if cfg.adaptiveQuality then
-		self:_updateAdaptiveQuality(renderMs)
+	if not self._bakeOverride then
+		if cfg.adaptiveQuality then
+			self:_updateAdaptiveQuality(renderMs)
+		end
+		self:_updateDebug(renderMs)
 	end
-	self:_updateDebug(renderMs)
 end
 
 -- ================================================================
@@ -1585,6 +1941,12 @@ function TopoShader:Start()
 	self._running = true
 	self:_refreshParallelState()
 
+	-- Auto-bake on start if the cache mode is enabled.
+	if self.cfg.cacheEnabled and self.cfg.bakeOnStart
+			and not self._cacheReady and not self._bakeActive then
+		self:_startBake()
+	end
+
 	-- Track mouse position in panel-local space (with GUI inset correction)
 	self._inputConn = UserInputService.InputChanged:Connect(function(inp)
 		if inp.UserInputType == Enum.UserInputType.MouseMovement then
@@ -1606,6 +1968,18 @@ function TopoShader:Start()
 		if dt > 0 then
 			self._debugReport.fps = 1 / dt
 		end
+
+		-- Bake phase runs every tick (no fps throttle) so it finishes as fast as possible.
+		-- The most-recently-baked frame is shown as a live preview while baking.
+		if self.cfg.cacheEnabled and self._bakeActive then
+			local bakeStart = os.clock()
+			self:_stepBakeTick()
+			-- Show the current _buf as a preview (updated by serial bake; may lag 1 tick for parallel).
+			self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), self._buf)
+			self:_updateDebug((os.clock() - bakeStart) * 1000)
+			return
+		end
+
 		self._accumTime += dt
 		if self._accumTime < inv then return end
 		self._accumTime -= inv
@@ -1708,6 +2082,17 @@ function TopoShader:SetConfig(key, value)
 			self:_rebuildLocalBackdrop()
 		end
 	end
+
+	-- Cache invalidation: if a rendering-affecting key changed, discard the baked frames
+	-- and start a fresh bake (if bakeOnStart is true).
+	if self.cfg.cacheEnabled and self._cacheReady and CACHE_INVALIDATE_KEYS[key] then
+		self._cacheReady = false
+		self._cache      = {}
+		if self.cfg.bakeOnStart and self._running then
+			self:_startBake()
+		end
+	end
+
 	return true
 end
 
@@ -2232,7 +2617,9 @@ function TopoShader:_rebuildParallelTiles()
 	end
 end
 
-function TopoShader:_dispatchParallelFrame(t)
+-- driftOverride (optional): {driftX, driftY, zSlice} — used during bake to supply
+-- sinusoidal loop drift instead of time-based linear drift.
+function TopoShader:_dispatchParallelFrame(t, driftOverride)
 	if not self._parallelReady then return false end
 	if self._parallelInFlight then return false end
 
@@ -2273,7 +2660,12 @@ function TopoShader:_dispatchParallelFrame(t)
 			rW = self._rW,
 			rH = self._rH,
 			time = t,
-			baseFrequency = self.cfg.baseFrequency,
+				-- Bake mode: pass pre-computed sinusoidal drift so workers produce
+				-- the correct seamless-loop frame instead of time-based drift.
+				bakeDriftX = driftOverride and driftOverride.driftX or nil,
+				bakeDriftY = driftOverride and driftOverride.driftY or nil,
+				bakeZSlice = driftOverride and driftOverride.zSlice or nil,
+				baseFrequency = self.cfg.baseFrequency,
 			contourLevels = self.cfg.contourLevels,
 			lineWidth = self.cfg.lineWidth,
 			softEdgesEnabled = self.cfg.softEdgesEnabled,
@@ -2548,16 +2940,34 @@ function TopoShader:GetDebugReport()
 		fakeLocalBackdropEnabled = self.cfg.fakeLocalBackdropEnabled,
 		fakeBackdropReady = d.fakeBackdropReady,
 		lastIssues = d.lastIssues,
+		-- cache
+		cacheEnabled    = self.cfg.cacheEnabled,
+		cacheReady      = d.cacheReady,
+		bakeActive      = self._bakeActive,
+		bakeProgress    = d.bakeProgress,
+		bakeTotalFrames = d.bakeTotalFrames,
 	}
 end
 
 function TopoShader:FormatDebugReport()
 	local d = self:GetDebugReport()
+	local cacheStr
+	if d.cacheEnabled then
+		if d.cacheReady then
+			cacheStr = string.format("cache:ready(%dframes)", d.bakeTotalFrames)
+		elseif d.bakeActive then
+			cacheStr = string.format("baking:%.0f%%", d.bakeProgress * 100)
+		else
+			cacheStr = "cache:idle"
+		end
+	else
+		cacheStr = "cache:off"
+	end
 	return string.format(
-		"[TopoShader] fps=%.1f render(ms)=%.2f avg=%.2f max=%.2f frames=%d overBudget=%d preset=%s adaptive=%s checker=%s edgeAA=%s issues=%s",
+		"[TopoShader] fps=%.1f render(ms)=%.2f avg=%.2f max=%.2f frames=%d overBudget=%d preset=%s adaptive=%s checker=%s edgeAA=%s %s issues=%s",
 		d.fps, d.lastRenderMs, d.renderMsAvg, d.renderMsMax, d.frames, d.overBudgetFrames,
 		tostring(d.qualityPreset), tostring(d.adaptiveQuality), tostring(d.checkerboard),
-		tostring(d.edgeAAEnabled), tostring(d.lastIssues)
+		tostring(d.edgeAAEnabled), cacheStr, tostring(d.lastIssues)
 	)
 end
 
@@ -2596,15 +3006,32 @@ function TopoShader:_updateDebug(renderMs)
 	if self.cfg.fakeLocalBackdropEnabled and self._vpfReady and (self.cfg.fakeLocalBackdropMaxParts or 0) <= 120 then
 		table.insert(issues, "fake_backdrop_low_detail")
 	end
+	if self.cfg.cacheEnabled and self._bakeActive then
+		table.insert(issues, string.format("baking_%d%%", _floor((d.bakeProgress or 0) * 100)))
+	end
 	d.lastIssues = (#issues > 0) and table.concat(issues, ",") or "ok"
 
 	if self.cfg.debugEnabled and self._debugLabel and self._debugClock >= (self.cfg.debugUpdateRate or 0.25) then
 		self._debugClock = 0
+		local cacheStatusStr
+		if self.cfg.cacheEnabled then
+			if self._cacheReady then
+				cacheStatusStr = string.format("Cache: ready (%d fr)", self._bakeTotalFrames)
+			elseif self._bakeActive then
+				cacheStatusStr = string.format("Baking: %d/%d (%.0f%%)",
+					self._bakeFI, self._bakeTotalFrames, d.bakeProgress * 100)
+			else
+				cacheStatusStr = "Cache: idle"
+			end
+		else
+			cacheStatusStr = "Cache: off"
+		end
 		self._debugLabel.Text = string.format(
-			"FPS: %.1f | Render: %.2fms (avg %.2f / max %.2f)\nPreset: %s | Adaptive: %s | Over budget: %d\nBlur local/global: %s/%s | Issues: %s",
+			"FPS: %.1f | Render: %.2fms (avg %.2f / max %.2f)\nPreset: %s | Adaptive: %s | Over budget: %d\n%s | Blur local/global: %s/%s | Issues: %s",
 			d.fps, d.lastRenderMs, d.renderMsAvg, d.renderMsMax,
 			tostring(self.cfg.qualityPreset), tostring(self.cfg.adaptiveQuality),
-			d.overBudgetFrames, tostring(self._localBlurReady), tostring(self.cfg.backgroundBlurEnabled), d.lastIssues
+			d.overBudgetFrames, cacheStatusStr,
+			tostring(self._localBlurReady), tostring(self.cfg.backgroundBlurEnabled), d.lastIssues
 		)
 	end
 	self:_stepAutoTune(renderMs)
