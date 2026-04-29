@@ -163,6 +163,26 @@ local DEFAULTS = {
 	mouseOverlayInCache = true,   -- recompute mouse-warp area live on top of cached frame
 	onBakeProgress      = nil,    -- callback(doneFrames, totalFrames) — fired each baked frame
 	onBakeComplete      = nil,    -- callback() — fired when bake finishes
+
+	-- ── HD Cache Boost ───────────────────────────────────────────
+	-- M5: configurable RAM budget with auto-adjust during bake planning.
+	cacheRamBudgetMB    = 400,    -- max RAM the cache may use (MB); auto-adjust kicks in
+	cacheAutoAdjust     = true,   -- if budget exceeded, enable compression/interpolation
+	-- M2: frame interpolation strategy. "prebaked" computes halfway frames at bake
+	-- time so runtime stays pure M1 zero-copy (no per-frame Lua lerp). "runtime"
+	-- is the legacy mode that blends each interpolated frame on the fly (slow on
+	-- HD resolutions but uses 50% less RAM). "off" disables interpolation entirely.
+	interpolationEnabled = true,
+	interpolationMode    = "prebaked",   -- "prebaked" | "runtime"
+	-- M3: per-frame EditableImage pool — fastest playback (just swaps ImageContent).
+	imagePoolEnabled    = true,   -- auto-fallback when allocation fails or overlay active
+	imagePoolMaxFrames  = 240,    -- safety cap on EditableImage instances
+	imagePoolMaxBytesMB = 96,     -- safety cap on total EI GPU memory (Roblox EI budget)
+	-- M4: delta compression — stores frames 1..N-1 as sparse diffs vs frame 0.
+	compressionMode     = "auto", -- "auto" | "off" | "delta" | "delta_rle"
+	compressionThreshold = 6,     -- 0..255 per-channel diff before storing a delta pixel
+	-- M7: bake more than one frame per tick if the budget allows.
+	bakeBurstMs         = 6,      -- max ms spent baking per RenderStepped tick
 }
 
 -- Beginner-safe config schema. Values are clamped/sanitized on write.
@@ -277,6 +297,17 @@ local CONFIG_RULES = {
 	bakeOnStart         = { t = "boolean" },
 	bakeUseParallel     = { t = "boolean" },
 	mouseOverlayInCache = { t = "boolean" },
+	-- HD Cache Boost
+	cacheRamBudgetMB    = { t = "number", min = 32, max = 4096 },
+	cacheAutoAdjust     = { t = "boolean" },
+	interpolationEnabled = { t = "boolean" },
+	interpolationMode   = { t = "enum", values = { prebaked = true, runtime = true } },
+	imagePoolEnabled    = { t = "boolean" },
+	imagePoolMaxFrames  = { t = "number", min = 8, max = 1024, integer = true },
+	imagePoolMaxBytesMB = { t = "number", min = 16, max = 1024 },
+	compressionMode     = { t = "enum", values = { auto = true, off = true, delta = true, delta_rle = true } },
+	compressionThreshold = { t = "number", min = 0, max = 64, integer = true },
+	bakeBurstMs         = { t = "number", min = 1, max = 50 },
 }
 
 -- Keys that require a full rebake when changed while cacheEnabled = true.
@@ -296,6 +327,9 @@ local CACHE_INVALIDATE_KEYS = {
 	glowEnabled=true, glowStrength=true,
 	vignetteEnabled=true, vignetteStrength=true,
 	bgColor=true, lineColor=true, colorLow=true, colorHigh=true,
+	-- HD Cache Boost: storage-affecting keys.
+	compressionMode=true, compressionThreshold=true,
+	interpolationEnabled=true, interpolationMode=true, imagePoolEnabled=true,
 }
 
 local THEMES = {
@@ -687,6 +721,12 @@ function TopoShader.new(parentGui, userConfig)
 		cacheReady = false,
 		bakeProgress = 0,
 		bakeTotalFrames = 0,
+		-- HD cache boost
+		cacheBudgetMB = 0,
+		cacheActualMB = 0,
+		cacheCompressionMode = "off",
+		interpolationActive = false,
+		imagePoolActive = false,
 	}
 	self._parallelReady = false
 	self._parallelWorkers = 0
@@ -704,7 +744,9 @@ function TopoShader.new(parentGui, userConfig)
 
 	-- Pre-cached loop playback state
 	self._bakeOverride        = nil   -- {driftX,driftY,zSlice} — set during _bakeFrameSerial
-	self._cache               = {}    -- array[i] = full RGBA buffer for baked frame i
+	self._cache               = {}    -- array[i] = full RGBA buffer for baked frame i (uncompressed)
+	self._cacheDelta          = {}    -- array[i] = { count, indices, pixels } when compressionMode active
+	self._cacheRefBuf         = nil   -- reference frame (idx 1, full buffer) used by delta path
 	self._cacheIdx            = 1     -- current playback frame index
 	self._cacheReady          = false
 	self._bakeActive          = false
@@ -713,6 +755,12 @@ function TopoShader.new(parentGui, userConfig)
 	self._bakeParallelWaiting = false
 	self._playBuf             = nil   -- writable scratch copy: cached frame + overlay
 	self._cacheAccum          = 0     -- time accumulator for cache frame rate
+
+	-- HD Cache Boost runtime state
+	self._cachePlan           = nil   -- result of _planBake: { useImagePool, useDelta, useInterp, totalFrames, ... }
+	self._eiPool              = {}    -- M3: array of EditableImage instances, one per frame
+	self._eiContents          = {}    -- M3: cached Content.fromObject for each EditableImage
+	self._cacheActualBytes    = 0     -- measured cache memory after bake
 
 	-- Pre-bake noise-space XY per pixel
 	-- This is the critical fix: frequency must be low
@@ -1284,33 +1332,357 @@ end
 --  PRE-CACHED LOOP PLAYBACK
 -- ================================================================
 
+-- ----------------------------------------------------------------
+-- M5: Bake Planner — decides storage strategy based on RAM budget.
+-- ----------------------------------------------------------------
+-- Computes a plan: { totalFrames, useInterpolation, useDelta, useImagePool, estimatedMB, mode }
+-- and adjusts the plan downward when the budget is exceeded. Pure function over cfg.
+function TopoShader:_planBake()
+	local cfg = self.cfg
+	local rW, rH = self._rW, self._rH
+	local pix = rW * rH
+	local bytesPerFrame = pix * 4
+	local requestedFrames = _max(1, _floor((cfg.loopFPS or 24) * (cfg.loopDuration or 4.0) + 0.5))
+	local budgetMB = _max(32, cfg.cacheRamBudgetMB or 400)
+	local autoAdjust = cfg.cacheAutoAdjust ~= false
+	local interpMode = cfg.interpolationMode or "prebaked"
+
+	local plan = {
+		bakedFrames    = requestedFrames,   -- frames actually rendered via noise
+		storedFrames   = requestedFrames,   -- buffers physically stored in _cache
+		playbackFrames = requestedFrames,   -- effective frame count seen at playback
+		useInterpolation = cfg.interpolationEnabled and true or false,
+		interpMode       = interpMode,      -- "prebaked" | "runtime"
+		useDelta         = false,
+		useImagePool     = cfg.imagePoolEnabled and true or false,
+		mode             = "uncompressed",
+	}
+
+	-- Apply requested interpolation. Both modes render half the noise frames; they
+	-- differ in whether the halfway frames are pre-blended at bake time (prebaked,
+	-- doubles storage but keeps runtime zero-copy) or computed at playback (runtime,
+	-- saves storage but adds a Lua lerp per displayed half-frame).
+	if plan.useInterpolation then
+		plan.bakedFrames = _max(2, _floor(requestedFrames / 2 + 0.5))
+		if interpMode == "prebaked" then
+			plan.storedFrames = plan.bakedFrames * 2   -- N keyframes + N pre-blended halves
+		else
+			plan.storedFrames = plan.bakedFrames       -- runtime blends on the fly
+		end
+		plan.playbackFrames = plan.bakedFrames * 2
+	else
+		plan.storedFrames   = plan.bakedFrames
+		plan.playbackFrames = plan.bakedFrames
+	end
+
+	-- Resolve compression mode.
+	local cmode = cfg.compressionMode or "auto"
+
+	local function estimateMB()
+		if plan.useDelta then
+			local deltaCount = plan.storedFrames - 1
+			return (bytesPerFrame + deltaCount * bytesPerFrame * 0.35) / (1024 * 1024)
+		end
+		return (plan.storedFrames * bytesPerFrame) / (1024 * 1024)
+	end
+
+	-- Honour explicit compression choice up-front.
+	if cmode == "delta" or cmode == "delta_rle" then
+		plan.useDelta = true
+		plan.useImagePool = false
+	end
+
+	-- Iteratively reduce until we fit the budget (only when auto-adjust is on).
+	local guard = 0
+	while autoAdjust and estimateMB() > budgetMB and guard < 8 do
+		guard += 1
+		if not plan.useInterpolation then
+			plan.useInterpolation = true
+			plan.bakedFrames = _max(2, _floor(requestedFrames / 2 + 0.5))
+			plan.storedFrames = (interpMode == "prebaked") and (plan.bakedFrames * 2) or plan.bakedFrames
+			plan.playbackFrames = plan.bakedFrames * 2
+		elseif plan.useInterpolation and interpMode == "prebaked" then
+			-- Switching prebaked → runtime halves storage without losing visual smoothness.
+			interpMode = "runtime"
+			plan.interpMode = "runtime"
+			plan.storedFrames = plan.bakedFrames
+		elseif not plan.useDelta and cmode == "auto" then
+			plan.useDelta = true
+			plan.useImagePool = false
+		else
+			-- Last resort: drop frames further.
+			plan.bakedFrames = _max(2, _floor(plan.bakedFrames * 0.8 + 0.5))
+			plan.storedFrames = (plan.interpMode == "prebaked") and (plan.bakedFrames * 2) or plan.bakedFrames
+			plan.playbackFrames = plan.useInterpolation and (plan.bakedFrames * 2) or plan.bakedFrames
+		end
+	end
+
+	-- ImagePool incompatible with delta storage.
+	if plan.useDelta then
+		plan.useImagePool = false
+		plan.mode = (cmode == "delta_rle") and "delta_rle" or "delta"
+	else
+		plan.mode = "uncompressed"
+	end
+
+	-- Cap pool by both frame count AND total EditableImage GPU memory. Roblox imposes
+	-- a per-place EI memory budget; running over it causes mid-bake allocation failure.
+	if plan.useImagePool then
+		local poolBytes = plan.storedFrames * bytesPerFrame
+		local poolMB    = poolBytes / (1024 * 1024)
+		local maxFrames = cfg.imagePoolMaxFrames or 240
+		local maxBytesMB = cfg.imagePoolMaxBytesMB or 96
+		if plan.storedFrames > maxFrames or poolMB > maxBytesMB then
+			plan.useImagePool = false
+			plan.poolSkippedReason = string.format("pool_over_budget:%.0fMB>%.0fMB", poolMB, maxBytesMB)
+		end
+	end
+
+	plan.estimatedMB = estimateMB()
+	plan.budgetMB    = budgetMB
+	return plan
+end
+
 -- Begin a fresh bake. Allocates state; actual rendering happens via _stepBakeTick().
 function TopoShader:_startBake()
-	local cfg = self.cfg
-	local totalFrames = _max(1, _floor((cfg.loopFPS or 24) * (cfg.loopDuration or 4.0) + 0.5))
+	local plan = self:_planBake()
+	self._cachePlan           = plan
 	self._cache               = {}
+	self._cacheDelta          = {}
+	self._cacheRefBuf         = nil
 	self._cacheIdx            = 1
 	self._cacheReady          = false
 	self._bakeActive          = true
-	self._bakeFI              = 0
-	self._bakeTotalFrames     = totalFrames
+	self._bakeFI              = 0   -- 0-based count of keyframes baked so far
+	self._bakeTotalFrames     = plan.bakedFrames    -- keyframes to render
+	self._bakeStoredFrames    = plan.storedFrames   -- buffers stored in _cache total
 	self._bakeParallelWaiting = false
 	self._cacheAccum          = 0
 	self._playBuf             = buffer.create(self._pixCount * 4)
-	self._debugReport.cacheReady    = false
-	self._debugReport.bakeProgress  = 0
-	self._debugReport.bakeTotalFrames = totalFrames
+	self._cacheActualBytes    = 0
+
+	-- Tear down previous EditableImage pool if any.
+	self:_destroyImagePool()
+
+	self._debugReport.cacheReady           = false
+	self._debugReport.bakeProgress         = 0
+	self._debugReport.bakeTotalFrames      = plan.bakedFrames
+	self._debugReport.cacheBudgetMB        = plan.budgetMB
+	self._debugReport.cacheActualMB        = plan.estimatedMB
+	self._debugReport.cacheCompressionMode = plan.mode
+	self._debugReport.interpolationActive  = plan.useInterpolation
+	self._debugReport.imagePoolActive      = plan.useImagePool
+	if plan.poolSkippedReason then
+		warn(string.format("[TopoShader] image pool disabled: %s", plan.poolSkippedReason))
+	end
 end
 
--- Copy the current _buf into a fresh buffer and store it as the next cached frame.
-function TopoShader:_storeBakeFrame()
-	local n   = self._pixCount * 4
+-- ----------------------------------------------------------------
+-- M4: encode current _buf as a sparse delta against the reference frame.
+-- ----------------------------------------------------------------
+-- Returns { count, indices(buffer u32*count), pixels(buffer u32*count) } where each
+-- pixel is packed RGBA into a single u32 for compact storage.
+function TopoShader:_encodeDeltaFrame(refBuf)
+	local pix = self._pixCount
 	local src = self._buf
-	local frame = buffer.create(n)
-	for i = 0, n - 1 do
-		buffer.writeu8(frame, i, buffer.readu8(src, i))
+	local thr = _max(0, self.cfg.compressionThreshold or 6)
+
+	-- First pass: count differing pixels.
+	local diffCount = 0
+	for pi = 0, pix - 1 do
+		local i = pi * 4
+		local dr = _abs(buffer.readu8(src, i)     - buffer.readu8(refBuf, i))
+		local dg = _abs(buffer.readu8(src, i + 1) - buffer.readu8(refBuf, i + 1))
+		local db = _abs(buffer.readu8(src, i + 2) - buffer.readu8(refBuf, i + 2))
+		local da = _abs(buffer.readu8(src, i + 3) - buffer.readu8(refBuf, i + 3))
+		if dr > thr or dg > thr or db > thr or da > thr then
+			diffCount += 1
+		end
 	end
-	self._cache[self._bakeFI + 1] = frame
+
+	if diffCount == 0 then
+		return { count = 0, indices = nil, pixels = nil }
+	end
+
+	local indices = buffer.create(diffCount * 4)
+	local pixels  = buffer.create(diffCount * 4)
+	local k = 0
+	for pi = 0, pix - 1 do
+		local i = pi * 4
+		local dr = _abs(buffer.readu8(src, i)     - buffer.readu8(refBuf, i))
+		local dg = _abs(buffer.readu8(src, i + 1) - buffer.readu8(refBuf, i + 1))
+		local db = _abs(buffer.readu8(src, i + 2) - buffer.readu8(refBuf, i + 2))
+		local da = _abs(buffer.readu8(src, i + 3) - buffer.readu8(refBuf, i + 3))
+		if dr > thr or dg > thr or db > thr or da > thr then
+			buffer.writeu32(indices, k * 4, pi)
+			buffer.writeu8(pixels, k * 4,     buffer.readu8(src, i))
+			buffer.writeu8(pixels, k * 4 + 1, buffer.readu8(src, i + 1))
+			buffer.writeu8(pixels, k * 4 + 2, buffer.readu8(src, i + 2))
+			buffer.writeu8(pixels, k * 4 + 3, buffer.readu8(src, i + 3))
+			k += 1
+		end
+	end
+
+	return { count = diffCount, indices = indices, pixels = pixels }
+end
+
+-- M4: reconstruct the full frame for index `idx` (1-based) into dst buffer.
+-- Uses _cacheRefBuf as the base and applies delta entries for non-reference frames.
+function TopoShader:_decodeDeltaFrame(idx, dst)
+	local refBuf = self._cacheRefBuf
+	if not refBuf then return end
+	-- buffer.copy(dst, dstOffset, src) copies the entire src.
+	buffer.copy(dst, 0, refBuf, 0, self._pixCount * 4)
+	if idx == 1 then return end
+	local delta = self._cacheDelta[idx]
+	if not delta or delta.count == 0 then return end
+	local count   = delta.count
+	local indices = delta.indices
+	local pixels  = delta.pixels
+	for k = 0, count - 1 do
+		local pi  = buffer.readu32(indices, k * 4)
+		local idxB = pi * 4
+		buffer.writeu8(dst, idxB,     buffer.readu8(pixels, k * 4))
+		buffer.writeu8(dst, idxB + 1, buffer.readu8(pixels, k * 4 + 1))
+		buffer.writeu8(dst, idxB + 2, buffer.readu8(pixels, k * 4 + 2))
+		buffer.writeu8(dst, idxB + 3, buffer.readu8(pixels, k * 4 + 3))
+	end
+end
+
+-- ----------------------------------------------------------------
+-- M3: Allocate one EditableImage slot in the pool. Used incrementally during
+-- bake so each frame's WritePixelsBuffer can target its own EI immediately.
+-- Returns the EditableImage on success, nil on failure (caller should fall back).
+-- ----------------------------------------------------------------
+function TopoShader:_acquireEditableImageSlot(slot)
+	if self._eiPool[slot] then return self._eiPool[slot] end
+	local ok, ei = pcall(function()
+		return AssetService:CreateEditableImage({ Size = Vector2.new(self._rW, self._rH) })
+	end)
+	if not (ok and ei) then return nil end
+	self._eiPool[slot] = ei
+	self._eiContents[slot] = Content.fromObject(ei)
+	return ei
+end
+
+-- Tear down all EditableImage slots (used on rebake or when pool is disabled).
+function TopoShader:_destroyImagePool()
+	for _, ei in pairs(self._eiPool) do
+		pcall(function() ei:Destroy() end)
+	end
+	self._eiPool = {}
+	self._eiContents = {}
+end
+
+-- Fast halfway blend between two source buffers. Specialized for t=0.5 (no multiply).
+function TopoShader:_blendHalfway(srcA, srcB, dst)
+	local n = self._pixCount * 4
+	for i = 0, n - 1 do
+		local a = buffer.readu8(srcA, i)
+		local b = buffer.readu8(srcB, i)
+		buffer.writeu8(dst, i, _floor((a + b + 1) * 0.5))
+	end
+end
+
+-- Push a single pre-computed buffer into the EditableImage pool slot.
+-- Returns true on success, false on allocation/write failure.
+function TopoShader:_pushPoolSlot(slot, frameBuf)
+	local plan = self._cachePlan
+	if not (plan and plan.useImagePool) then return true end
+	local ei = self:_acquireEditableImageSlot(slot)
+	local ok = ei ~= nil
+	if ok then
+		ok = pcall(function()
+			ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), frameBuf)
+		end)
+	end
+	if not ok then
+		-- Tear down pool entirely so playback uses the (consistent) buffered path.
+		self:_destroyImagePool()
+		plan.useImagePool = false
+		self._debugReport.imagePoolActive = false
+	end
+	return ok
+end
+
+-- M1: byte-fast frame copy using buffer.copy (native), replaces O(N) Lua byte-loop.
+-- Stores the current _buf as the next cached frame, applying compression if enabled.
+-- For prebaked interpolation: keyframe i (0-based) goes to slot (2i+1) (1-based);
+-- the in-between slot (2i) is filled with a halfway blend between previous and current.
+function TopoShader:_storeBakeFrame()
+	local plan = self._cachePlan
+	local n    = self._pixCount * 4
+	local fi   = self._bakeFI                -- 0-based keyframe index just rendered
+	local prebakedInterp = plan and plan.useInterpolation and plan.interpMode == "prebaked"
+
+	if plan and plan.useDelta then
+		-- Delta path: the slot indexing is based on storedFrames (which equals
+		-- bakedFrames in runtime-interp mode and 2*bakedFrames in prebaked-interp mode).
+		-- Reference frame is always slot 1.
+		local slot
+		if prebakedInterp then
+			slot = fi * 2 + 1
+		else
+			slot = fi + 1
+		end
+		if slot == 1 then
+			local refBuf = buffer.create(n)
+			buffer.copy(refBuf, 0, self._buf, 0, n)
+			self._cacheRefBuf = refBuf
+			self._cache[1] = refBuf
+			self._cacheActualBytes += n
+		else
+			local delta = self:_encodeDeltaFrame(self._cacheRefBuf)
+			self._cacheDelta[slot] = delta
+			self._cacheActualBytes += (delta.count or 0) * 8
+			-- Prebaked halfway slot for delta path: encode a halfway buffer too.
+			if prebakedInterp then
+				local prevSlot = slot - 2   -- previous keyframe's slot (always odd)
+				if prevSlot >= 1 then
+					-- Reconstruct previous keyframe pixel data, blend with current _buf, then encode delta.
+					local scratchPrev = self._aaBuf
+					self:_decodeDeltaFrame(prevSlot, scratchPrev)
+					local halfBuf = buffer.create(n)
+					self:_blendHalfway(scratchPrev, self._buf, halfBuf)
+					-- Temporarily swap _buf to the halfway result so encodeDelta sees it.
+					local saved = self._buf
+					self._buf = halfBuf
+					local halfDelta = self:_encodeDeltaFrame(self._cacheRefBuf)
+					self._buf = saved
+					self._cacheDelta[slot - 1] = halfDelta
+					self._cacheActualBytes += (halfDelta.count or 0) * 8
+				end
+			end
+		end
+		return
+	end
+
+	-- Uncompressed path. Allocate a fresh buffer for the keyframe.
+	local frame = buffer.create(n)
+	buffer.copy(frame, 0, self._buf, 0, n)
+	local slot
+	if prebakedInterp then
+		slot = fi * 2 + 1   -- keyframes occupy odd slots: 1, 3, 5, ...
+	else
+		slot = fi + 1
+	end
+	self._cache[slot] = frame
+	self._cacheActualBytes += n
+
+	-- M3: push the keyframe into its EI slot.
+	self:_pushPoolSlot(slot, frame)
+
+	-- Prebaked halfway frame between this keyframe and the previous one.
+	if prebakedInterp and fi >= 1 then
+		local prevFrame = self._cache[slot - 2]
+		if prevFrame then
+			local halfBuf = buffer.create(n)
+			self:_blendHalfway(prevFrame, frame, halfBuf)
+			self._cache[slot - 1] = halfBuf
+			self._cacheActualBytes += n
+			self:_pushPoolSlot(slot - 1, halfBuf)
+		end
+	end
 end
 
 -- Render one bake frame using provided drift values (serial path only).
@@ -1331,84 +1703,166 @@ function TopoShader:_bakeFrameSerial(driftX, driftY, zSlice)
 	self._bakeOverride = nil
 end
 
--- Called once per RenderStepped tick while a bake is active.
--- Renders one frame (serial or parallel) and stores it when complete.
-function TopoShader:_stepBakeTick()
-	local cfg   = self.cfg
-	local fi    = self._bakeFI
-	local total = self._bakeTotalFrames
+-- Helper: finalize the bake — fill the wraparound halfway slot (prebaked interp),
+-- mark ready and update reporting.
+function TopoShader:_finalizeBake()
+	local cfg  = self.cfg
+	local plan = self._cachePlan
 
-	-- Bake complete?
-	if fi >= total then
-		self._bakeActive = false
-		self._cacheReady = true
-		self._debugReport.cacheReady   = true
-		self._debugReport.bakeProgress = 1
-		if type(cfg.onBakeComplete) == "function" then
-			pcall(cfg.onBakeComplete)
-		end
-		return
-	end
-
-	-- Waiting for async parallel workers to finish the current frame.
-	if self._bakeParallelWaiting then
-		if self._parallelFrameReady then
-			-- Apply the same post-processing passes as the parallel live path.
-			if cfg.glowEnabled then self:_applyGlow() end
-			if cfg.edgeAAEnabled then self:_applyEdgeAA() end
-			if cfg.generatorScaleEnabled then self:_applyGeneratorScale() end
-			if cfg.fakeAABlurEnabled then self:_applyFakeAABlur() end
-			self:_storeBakeFrame()
-			self._parallelFrameReady   = false
-			self._parallelInFlight     = false
-			self._bakeParallelWaiting  = false
-			self._bakeFI              += 1
-			self._debugReport.bakeProgress = self._bakeFI / total
-			if type(cfg.onBakeProgress) == "function" then
-				pcall(cfg.onBakeProgress, self._bakeFI, total)
+	-- Prebaked interpolation needs a wraparound halfway slot bridging the last keyframe
+	-- back to the first. Otherwise playback would skip from frame 2N-1 directly to 1
+	-- with a visible motion gap.
+	if plan and plan.useInterpolation and plan.interpMode == "prebaked" then
+		local n     = self._pixCount * 4
+		local total = plan.bakedFrames
+		local wrapSlot = total * 2   -- last even slot
+		if plan.useDelta then
+			-- Decode last and first keyframes, blend, encode as delta.
+			local scratchLast  = self._aaBuf
+			local scratchFirst = self._playBuf
+			self:_decodeDeltaFrame(total * 2 - 1, scratchLast)
+			self:_decodeDeltaFrame(1, scratchFirst)
+			local halfBuf = buffer.create(n)
+			self:_blendHalfway(scratchLast, scratchFirst, halfBuf)
+			local saved = self._buf
+			self._buf = halfBuf
+			local d = self:_encodeDeltaFrame(self._cacheRefBuf)
+			self._buf = saved
+			self._cacheDelta[wrapSlot] = d
+			self._cacheActualBytes += (d.count or 0) * 8
+		else
+			local last  = self._cache[total * 2 - 1]
+			local first = self._cache[1]
+			if last and first then
+				local halfBuf = buffer.create(n)
+				self:_blendHalfway(last, first, halfBuf)
+				self._cache[wrapSlot] = halfBuf
+				self._cacheActualBytes += n
+				self:_pushPoolSlot(wrapSlot, halfBuf)
 			end
 		end
-		-- Don't dispatch another frame until this one is collected.
-		return
 	end
 
-	-- Compute sinusoidal loop phase for this frame.
-	-- phase sweeps 0 → 2π over the full loop, guaranteeing frame[0] == frame[N].
-	local phase   = (fi / total) * 2 * math.pi
-	local loopAmp = cfg.loopAmplitude  or 0.15
-	local loopZ   = cfg.loopZAmplitude or 0.08
-	local driftX  = _cos(cfg.animAngle or 0.45) * loopAmp *  _sin(phase)
-	local driftY  = _sin(cfg.animAngle or 0.45) * loopAmp * (-_cos(phase))
-	local zSlice  = loopZ * _sin(phase + math.pi * 0.5)
-
-	-- Try parallel bake first.
-	if self._parallelReady and cfg.bakeUseParallel and cfg.parallelEnabled then
-		local ok = self:_dispatchParallelFrame(
-			0, { driftX = driftX, driftY = driftY, zSlice = zSlice }
-		)
-		if ok then
-			self._bakeParallelWaiting = true
-			return
-		end
+	self._bakeActive = false
+	self._cacheReady = true
+	self._debugReport.cacheReady    = true
+	self._debugReport.bakeProgress  = 1
+	self._debugReport.cacheActualMB = self._cacheActualBytes / (1024 * 1024)
+	if plan then
+		self._debugReport.imagePoolActive = plan.useImagePool and (#self._eiPool > 0)
 	end
-
-	-- Serial fallback: render directly on the main thread.
-	self:_bakeFrameSerial(driftX, driftY, zSlice)
-	self:_storeBakeFrame()
-	self._bakeFI += 1
-	self._debugReport.bakeProgress = self._bakeFI / total
-	if type(cfg.onBakeProgress) == "function" then
-		pcall(cfg.onBakeProgress, self._bakeFI, total)
+	if type(cfg.onBakeComplete) == "function" then
+		pcall(cfg.onBakeComplete)
 	end
 end
 
--- Zero-cost playback: advance cache frame index at loopFPS rate, write to EditableImage.
+-- Called once per RenderStepped tick while a bake is active.
+-- M7: spends up to bakeBurstMs milliseconds rendering as many frames as possible
+-- in this tick, instead of strictly one frame per tick.
+function TopoShader:_stepBakeTick()
+	local cfg       = self.cfg
+	local total     = self._bakeTotalFrames
+	local burstMs   = _max(1, cfg.bakeBurstMs or 6)
+	local burstStart = os.clock()
+
+	-- Helper: render one logical "step" of the bake. Returns true if a frame completed
+	-- (so the caller can decide whether the burst should continue), false otherwise.
+	local function step()
+		local fi = self._bakeFI
+
+		if fi >= total then
+			self:_finalizeBake()
+			return true
+		end
+
+		-- Waiting for async parallel workers to finish the current frame.
+		if self._bakeParallelWaiting then
+			if self._parallelFrameReady then
+				if cfg.glowEnabled then self:_applyGlow() end
+				if cfg.edgeAAEnabled then self:_applyEdgeAA() end
+				if cfg.generatorScaleEnabled then self:_applyGeneratorScale() end
+				if cfg.fakeAABlurEnabled then self:_applyFakeAABlur() end
+				self:_storeBakeFrame()
+				self._parallelFrameReady   = false
+				self._parallelInFlight     = false
+				self._bakeParallelWaiting  = false
+				self._bakeFI              += 1
+				self._debugReport.bakeProgress = self._bakeFI / total
+				if type(cfg.onBakeProgress) == "function" then
+					pcall(cfg.onBakeProgress, self._bakeFI, total)
+				end
+				return true
+			end
+			return false   -- still waiting; do not burst
+		end
+
+		-- Phase sweep over BAKED frames (interpolation is a playback-only concern).
+		local phase   = (fi / total) * 2 * math.pi
+		local loopAmp = cfg.loopAmplitude  or 0.15
+		local loopZ   = cfg.loopZAmplitude or 0.08
+		local driftX  = _cos(cfg.animAngle or 0.45) * loopAmp *  _sin(phase)
+		local driftY  = _sin(cfg.animAngle or 0.45) * loopAmp * (-_cos(phase))
+		local zSlice  = loopZ * _sin(phase + math.pi * 0.5)
+
+		if self._parallelReady and cfg.bakeUseParallel and cfg.parallelEnabled then
+			local ok = self:_dispatchParallelFrame(
+				0, { driftX = driftX, driftY = driftY, zSlice = zSlice }
+			)
+			if ok then
+				self._bakeParallelWaiting = true
+				return false   -- async path; can't burst
+			end
+		end
+
+		self:_bakeFrameSerial(driftX, driftY, zSlice)
+		self:_storeBakeFrame()
+		self._bakeFI += 1
+		self._debugReport.bakeProgress = self._bakeFI / total
+		if type(cfg.onBakeProgress) == "function" then
+			pcall(cfg.onBakeProgress, self._bakeFI, total)
+		end
+		return true
+	end
+
+	-- M7: keep stepping as long as we still have ms in our budget AND each step
+	-- completed (so we don't spin while waiting on async workers).
+	repeat
+		local advanced = step()
+		if not advanced then break end
+		if not self._bakeActive then break end   -- _finalizeBake fired
+	until (os.clock() - burstStart) * 1000 >= burstMs
+end
+
+-- ----------------------------------------------------------------
+-- M2: Linear interpolation between two cached frames into dst buffer.
+-- ----------------------------------------------------------------
+function TopoShader:_blendFrames(frameA, frameB, t, dst)
+	local n = self._pixCount * 4
+	if t <= 0 then
+		buffer.copy(dst, 0, frameA, 0, n)
+		return
+	end
+	if t >= 1 then
+		buffer.copy(dst, 0, frameB, 0, n)
+		return
+	end
+	local invT = 1 - t
+	for i = 0, n - 1 do
+		local a = buffer.readu8(frameA, i)
+		local b = buffer.readu8(frameB, i)
+		buffer.writeu8(dst, i, _floor(a * invT + b * t + 0.5))
+	end
+end
+
+-- Multi-path zero-cost playback. Routes to the fastest path compatible with the
+-- current state: M3 ImageContent swap, M1 zero-copy, M4 delta decode, or runtime blend.
 function TopoShader:_playbackTick(dt)
 	if not self._cacheReady then return end
-	local total = self._bakeTotalFrames
+	local plan  = self._cachePlan
+	local total = plan and plan.playbackFrames or self._bakeTotalFrames
 	if total <= 0 then return end
 
-	-- Advance at loopFPS rate independent of cfg.fps.
+	-- Advance accumulator at loopFPS rate, independent of cfg.fps.
 	self._cacheAccum += (dt or (1 / _max(1, self.cfg.fps or 60)))
 	local cacheInv = 1 / _max(1, self.cfg.loopFPS or 24)
 	while self._cacheAccum >= cacheInv do
@@ -1416,24 +1870,82 @@ function TopoShader:_playbackTick(dt)
 		self._cacheIdx = (self._cacheIdx % total) + 1
 	end
 
-	local frame = self._cache[self._cacheIdx]
-	if not frame then return end
+	local cfg = self.cfg
+	local needsOverlay = cfg.mouseOverlayInCache and cfg.mouseEnabled
+			and (cfg.mouseStrength or 0) > 0 and (cfg.mouseRadius or 0) > 0
 
-	-- Copy cached frame into the writable play buffer.
-	local playBuf = self._playBuf
-	local n = self._pixCount * 4
-	for i = 0, n - 1 do
-		buffer.writeu8(playBuf, i, buffer.readu8(frame, i))
+	-- Map playback frame -> (idxA, idxB, blendT). Three cases:
+	--   A) no interpolation              → idxA = idxB = playback index, blendT = 0
+	--   B) interpolation, prebaked       → idxA = playback index (already includes halves), blendT = 0
+	--   C) interpolation, runtime        → idxA/B = adjacent keyframes, blendT = 0 or 0.5
+	local idxA, idxB, blendT
+	if plan and plan.useInterpolation and plan.interpMode == "runtime" then
+		local bakedFrames = plan.bakedFrames
+		local pi  = self._cacheIdx - 1   -- 0-based
+		local pa  = _floor(pi / 2)
+		local odd = pi - pa * 2
+		idxA = pa + 1
+		idxB = (pa + 1) % bakedFrames + 1
+		blendT = (odd == 1) and 0.5 or 0
+	else
+		-- prebaked or no-interp: every storage slot maps 1:1 to a playback index.
+		idxA = self._cacheIdx
+		idxB = self._cacheIdx
+		blendT = 0
 	end
 
-	-- Optional live mouse overlay (only pixels inside mouse radius are recomputed).
-	if self.cfg.mouseOverlayInCache and self.cfg.mouseEnabled
-			and (self.cfg.mouseStrength or 0) > 0
-			and (self.cfg.mouseRadius  or 0) > 0 then
+	local dim = Vector2.new(self._rW, self._rH)
+
+	-- ── Path A: M3 ImageContent swap (uncompressed, no overlay, no interpolation midpoint) ──
+	if plan and plan.useImagePool and not needsOverlay and blendT == 0 then
+		local content = self._eiContents[idxA]
+		if content then
+			self._img.ImageContent = content
+			return
+		end
+	end
+
+	-- ── Path B: M4 delta decode + WritePixelsBuffer ──
+	if plan and plan.useDelta then
+		local playBuf = self._playBuf
+		if blendT == 0 then
+			self:_decodeDeltaFrame(idxA, playBuf)
+		else
+			-- Need both endpoints. Decode A into playBuf, B into a scratch, then blend.
+			self:_decodeDeltaFrame(idxA, playBuf)
+			-- Reuse _aaBuf as scratch (safe: AA passes are off in cache mode).
+			local scratch = self._aaBuf
+			self:_decodeDeltaFrame(idxB, scratch)
+			self:_blendFrames(playBuf, scratch, blendT, playBuf)
+		end
+		if needsOverlay then
+			self:_applyMouseOverlayPatch(playBuf)
+		end
+		self._ei:WritePixelsBuffer(Vector2.zero, dim, playBuf)
+		return
+	end
+
+	-- ── Path C: M1 Zero-Copy (uncompressed direct write) ──
+	local frameA = self._cache[idxA]
+	if not frameA then return end
+	if blendT == 0 and not needsOverlay then
+		-- Direct write — no Lua-side copy. Massive savings at HD resolution.
+		self._ei:WritePixelsBuffer(Vector2.zero, dim, frameA)
+		return
+	end
+
+	-- ── Path D: M2 interpolation OR overlay → use scratch playBuf ──
+	local playBuf = self._playBuf
+	if blendT > 0 then
+		local frameB = self._cache[idxB] or frameA
+		self:_blendFrames(frameA, frameB, blendT, playBuf)
+	else
+		buffer.copy(playBuf, 0, frameA, 0, self._pixCount * 4)
+	end
+	if needsOverlay then
 		self:_applyMouseOverlayPatch(playBuf)
 	end
-
-	self._ei:WritePixelsBuffer(Vector2.zero, Vector2.new(self._rW, self._rH), playBuf)
+	self._ei:WritePixelsBuffer(Vector2.zero, dim, playBuf)
 end
 
 -- Recompute only the pixels within mouseRadius of the cursor and patch playBuf.
@@ -1562,6 +2074,59 @@ function TopoShader:Rebake()
 	end
 	self:_startBake()
 	return true
+end
+
+-- ----------------------------------------------------------------
+-- M6: CalibrateForDisplay — returns a recommended config table for a given
+-- display resolution. Pass the result into TopoShader.new() to construct.
+-- Render resolution can NOT be changed safely at runtime because internal
+-- buffers/coord caches are sized at construction.
+--
+--   local cfg = TopoShader.CalibrateForDisplay(1280, 720, { qualityHint = "high" })
+--   local shader = TopoShader.new(parent, cfg)
+--
+-- qualityHint: "low" (40%), "balanced" (55%, default), "high" (70%), "ultra" (100%)
+-- ----------------------------------------------------------------
+function TopoShader.CalibrateForDisplay(displayW, displayH, opts)
+	opts = opts or {}
+	local hint = opts.qualityHint or "balanced"
+	local scale
+	if     hint == "low"      then scale = 0.40
+	elseif hint == "high"     then scale = 0.70
+	elseif hint == "ultra"    then scale = 1.00
+	else                           scale = 0.55 end   -- balanced default
+
+	local rW = _max(64, _min(1024, _floor(displayW * scale + 0.5)))
+	local rH = _max(64, _min(1024, _floor(displayH * scale + 0.5)))
+
+	local loopFPS      = opts.loopFPS      or 20
+	local loopDuration = opts.loopDuration or 8.0
+	local frames       = _max(1, _floor(loopFPS * loopDuration + 0.5))
+	local estimateMB   = (rW * rH * 4 * frames) / (1024 * 1024)
+
+	return {
+		width        = displayW,
+		height       = displayH,
+		renderWidth  = rW,
+		renderHeight = rH,
+		upscaleMode  = "bilinear",
+		cacheEnabled = true,
+		bakeOnStart  = true,
+		loopFPS      = loopFPS,
+		loopDuration = loopDuration,
+		cacheRamBudgetMB = opts.maxRamMB or _max(256, _floor(estimateMB * 1.2 + 0.5)),
+		cacheAutoAdjust = true,
+		interpolationEnabled = true,
+		imagePoolEnabled = true,
+		compressionMode  = "auto",
+		bakeBurstMs      = 6,
+		_calibration = {
+			qualityHint = hint,
+			estimateMB  = estimateMB,
+			renderWidth = rW,
+			renderHeight = rH,
+		},
+	}
 end
 
 -- ================================================================
@@ -2946,6 +3511,12 @@ function TopoShader:GetDebugReport()
 		bakeActive      = self._bakeActive,
 		bakeProgress    = d.bakeProgress,
 		bakeTotalFrames = d.bakeTotalFrames,
+		-- HD cache boost
+		cacheBudgetMB        = d.cacheBudgetMB,
+		cacheActualMB        = d.cacheActualMB,
+		cacheCompressionMode = d.cacheCompressionMode,
+		interpolationActive  = d.interpolationActive,
+		imagePoolActive      = d.imagePoolActive,
 	}
 end
 
@@ -3016,7 +3587,19 @@ function TopoShader:_updateDebug(renderMs)
 		local cacheStatusStr
 		if self.cfg.cacheEnabled then
 			if self._cacheReady then
-				cacheStatusStr = string.format("Cache: ready (%d fr)", self._bakeTotalFrames)
+				local interpTag = ""
+				if d.interpolationActive then
+					local plan = self._cachePlan
+					interpTag = (plan and plan.interpMode == "prebaked") and " +interp(prebaked)" or " +interp(runtime)"
+				end
+				cacheStatusStr = string.format(
+					"Cache: ready (%d fr, %.0f/%.0f MB, %s%s%s)",
+					self._bakeStoredFrames or self._bakeTotalFrames,
+					d.cacheActualMB or 0, d.cacheBudgetMB or 0,
+					tostring(d.cacheCompressionMode or "off"),
+					interpTag,
+					d.imagePoolActive and " +pool" or ""
+				)
 			elseif self._bakeActive then
 				cacheStatusStr = string.format("Baking: %d/%d (%.0f%%)",
 					self._bakeFI, self._bakeTotalFrames, d.bakeProgress * 100)
@@ -3051,6 +3634,10 @@ function TopoShader:Destroy()
 		self._vpf:Destroy()
 		self._vpf = nil
 	end
+	self:_destroyImagePool()
+	self._cache       = {}
+	self._cacheDelta  = {}
+	self._cacheRefBuf = nil
 	self._root:Destroy()
 end
 
