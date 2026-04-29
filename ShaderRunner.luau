@@ -6,33 +6,33 @@ local TopoShader = require(script:WaitForChild("TopoShader"))
 -- 3) All runtime SetConfig/Configure writes are clamped by schema
 local shader = TopoShader.new(script.Parent, {
 	-- Panel
-	width        = 460,
-	height       = 300,
+	width        = 1280,
+	height       = 720,
 
 	-- Ultra-low runtime baseline (stabilize frame time first)
-	renderWidth  = 148,
-	renderHeight = 96,
+	renderWidth  = 896,
+	renderHeight = 504,
 	upscaleMode  = "bilinear",
 
 	-- ── The critical number: LOW frequency = smooth hills ──────
 	-- (renderWidth × baseFrequency) should be ~1.5 to 3.0
 	-- 230 × 0.008 = 1.84  ← a couple of hills across the panel ✓
-	baseFrequency = 0.008,
+	baseFrequency = 0.0072,
 
 	-- Contours
-	contourLevels = 8,
-	lineWidth     = 0.13,
+	contourLevels = 10,
+	lineWidth     = 0.105,
 
 	-- Noise character
 	octaves     = 4,
-	lacunarity  = 2.10,
-	persistence = 0.52,
-	warpAmount  = 1.0,
+	lacunarity  = 2.05,
+	persistence = 0.50,
+	warpAmount  = 1.25,
 	fastMode    = true,
 	ultraFastMode = true,
-	checkerboardReconstruction = true,
-	interlacedMode = "checkerboard",
-	temporalBlend = 0.18,
+	checkerboardReconstruction = false,
+	interlacedMode = "off",
+	temporalBlend = 0.0,
 	edgeAAEnabled   = false,
 	edgeAAStrength  = 0.40,
 	edgeAAThreshold = 16,
@@ -59,22 +59,63 @@ local shader = TopoShader.new(script.Parent, {
 	fakeAABlurThreshold = 0.09,
 	fakeAABlurInterval = 2,
 	qualityPreset   = "balanced",
-	adaptiveQuality = true,
+	adaptiveQuality = false,
 	frameBudgetMs   = 16.6,
 	debugEnabled    = true,
 	debugUpdateRate = 0.25,
 	visualProfile   = "performance",
 	vignetteEnabled = true,
-	vignetteStrength = 0.10,
-	lineSharpness   = 0.88,
-	parallelEnabled = false,
+	vignetteStrength = 0.08,
+	lineSharpness   = 0.90,
+	parallelEnabled = true,
 	parallelWorkers = 4,
 	parallelTileWidth = 64,
 	parallelTileHeight = 64,
 	parallelProgressive = true,
-	parallelTilesPerFrame = 6,
+	parallelTilesPerFrame = 8,
 	theme = "classic",
 	topoMode = "classic",
+
+	-- ── Pre-Cached Loop Playback ─────────────────────────────────
+	-- Enable to bake a seamless loop once, then play at ~0 CPU cost.
+	-- Recommended: set renderWidth/renderHeight to ~quarter of your panel for
+	-- a 47 MB cache (480×270, 96 frames) that bilinear-stretches beautifully.
+	-- Example for a 1920×1080 panel: renderWidth=480, renderHeight=270.
+	cacheEnabled    = true,  -- set true to activate; press F7 in-game to toggle
+	loopDuration    = 12.0,   -- seconds per seamless loop (longer = less repetitive)
+	loopFPS         = 20,     -- frames baked per second (12.0 * 20 = 240 frames)
+	loopAmplitude   = 0.22,   -- how far the terrain drifts over the loop
+	loopZAmplitude  = 0.12,   -- z-slice oscillation magnitude
+	bakeOnStart     = true,   -- auto-bake when shader:Start() is called
+	bakeUseParallel = true,   -- faster bake if Actor workers are configured
+	mouseOverlayInCache = true,   -- mouse warp still works during playback
+
+	-- ── HD Cache Boost ───────────────────────────────────────────
+	-- M5: configurable RAM budget. Auto-adjust kicks in if exceeded.
+	cacheRamBudgetMB     = 400,
+	cacheAutoAdjust      = true,
+	-- M2: frame interpolation. "prebaked" computes halfway frames at bake-time
+	-- (uniform fast playback, no Lua lerp). "runtime" blends on the fly (saves RAM
+	-- but causes per-frame stutters at HD resolution).
+	interpolationEnabled = true,
+	interpolationMode    = "prebaked",
+	-- M3: per-frame EditableImage pool — fastest playback (ImageContent swap).
+	-- Pool is automatically skipped when its GPU memory would exceed
+	-- imagePoolMaxBytesMB (Roblox enforces a per-place EditableImage budget).
+	imagePoolEnabled     = true,
+	imagePoolMaxFrames   = 240,
+	imagePoolMaxBytesMB  = 96,
+	-- M4: delta compression — kicks in automatically if budget tight.
+	compressionMode      = "auto",   -- "auto" | "off" | "delta" | "delta_rle"
+	compressionThreshold = 6,
+	-- M7: bake more than one frame per tick if the frame still has time left.
+	bakeBurstMs          = 8,
+	onBakeProgress  = function(done, total)
+		print(string.format("[TopoShader] baking %d/%d (%.0f%%)", done, total, done/total*100))
+	end,
+	onBakeComplete  = function()
+		print("[TopoShader] bake complete — playing from cache at ~0 CPU")
+	end,
 
 	-- Slow drift
 	animSpeed = 0.018,
@@ -90,14 +131,14 @@ local shader = TopoShader.new(script.Parent, {
 	cursorDitherScale = 2,
 	cursorDitherPattern = "bayer4",
 
-	-- Dark navy bg, white lines, blue-to-white elevation tint
-	bgColor   = { r=0.016, g=0.016, b=0.022, a=1 },
-	lineColor = { r=1,     g=1,     b=1,     a=1 },
+	-- Dark moody navy bg with soft violet topo lines (matches reference image)
+	bgColor   = { r=0.010, g=0.012, b=0.030, a=1 },
+	lineColor = { r=0.300, g=0.320, b=0.500, a=1 },
 
 	elevationTint = true,
-	colorLow      = { r=0.12, g=0.28, b=0.68 },
-	colorHigh     = { r=0.80, g=0.93, b=1.00 },
-	tintAmount    = 0.45,
+	colorLow      = { r=0.120, g=0.130, b=0.280 },
+	colorHigh     = { r=0.320, g=0.340, b=0.560 },
+	tintAmount    = 0.35,
 
 	glowEnabled  = false,
 	glowStrength = 0.08,
@@ -132,7 +173,7 @@ shader:SetQualityPreset("performance")
 shader:SetVisualProfile("performance")
 shader:ApplyTopoMode("classic")
 shader:Configure({
-	adaptiveQuality = true,
+	adaptiveQuality = false,
 	lineAAMode = "off",
 	lineAAEnabled = false,
 	analyticalAAEnabled = false,
@@ -142,9 +183,9 @@ shader:Configure({
 	softEdgeWidth = 0.28,
 	generatorScaleEnabled = false,
 	fakeAABlurEnabled = false,
-	checkerboardReconstruction = true,
-	interlacedMode = "checkerboard",
-	temporalBlend = 0.18,
+	checkerboardReconstruction = false,
+	interlacedMode = "off",
+	temporalBlend = 0.0,
 	mouseEnabled = false,
 	fakeLocalBackdropEnabled = false,
 	backgroundBlurEnabled = false,
@@ -270,6 +311,44 @@ UIS.InputBegan:Connect(function(inp, gp)
 		shader:SetParallelEnabled(not shader.cfg.parallelEnabled)
 		print("[TopoShader] parallelEnabled =", shader.cfg.parallelEnabled)
 	end
+	-- F7 = toggle pre-cache mode on/off (triggers a bake when turned on)
+	if k == "F7" then
+		local newVal = not shader.cfg.cacheEnabled
+		shader:Configure({ cacheEnabled = newVal })
+		if newVal then
+			local ok, err = shader:Rebake()
+			if ok then
+				print("[TopoShader] cache enabled — bake started")
+			else
+				print("[TopoShader] cache enabled but bake failed:", err)
+			end
+		else
+			print("[TopoShader] cache disabled — back to live render")
+		end
+	end
+	-- R = manually trigger a rebake (cache must be enabled)
+	if k == "R" then
+		local ok, err = shader:Rebake()
+		if ok then
+			print("[TopoShader] rebake started")
+		else
+			print("[TopoShader] rebake:", err)
+		end
+	end
+	-- F11 = cycle cache RAM budget (200 / 400 / 800 MB) and rebake
+	if k == "F11" then
+		local cur = shader.cfg.cacheRamBudgetMB or 400
+		local nxt = (cur < 300) and 400 or (cur < 600) and 800 or 200
+		shader:Configure({ cacheRamBudgetMB = nxt })
+		print("[TopoShader] cacheRamBudgetMB =", nxt, "MB")
+		if shader.cfg.cacheEnabled then shader:Rebake() end
+	end
+	-- F12 = toggle frame interpolation (M2) and rebake
+	if k == "F12" then
+		shader:Configure({ interpolationEnabled = not shader.cfg.interpolationEnabled })
+		print("[TopoShader] interpolationEnabled =", shader.cfg.interpolationEnabled)
+		if shader.cfg.cacheEnabled then shader:Rebake() end
+	end
 	-- I / O = progressive tiles per frame down / up
 	if k == "I" then
 		shader:Configure({ parallelTilesPerFrame = math.max(1, (shader.cfg.parallelTilesPerFrame or 6) - 1) })
@@ -386,7 +465,7 @@ UIS.InputBegan:Connect(function(inp, gp)
 	end
 	-- H = print keybind help
 	if k == "H" then
-		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 4/5 morph t | 6 morph target B | 7/8/9 visuals | T theme | G topo mode(A) | Y fake backdrop quality | M mouse | X cursor dither | C dither pattern | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | L analyticalAA | Q upscale mode | \\ interlaced mode | N edgeAA quality | Z generator scaling | K adaptive toggle | 0 adaptive on | F6 auto-tune | F8 overlay | F9 report | F10 parallel | I/O tiles/frame")
+		print("[TopoShader keys] P pause | [ ] contours | 1/2/3 quality (locks adaptive off) | 4/5 morph t | 6 morph target B | 7/8/9 visuals | T theme | G topo mode(A) | Y fake backdrop quality | M mouse | X cursor dither | C dither pattern | ;/' mouse strength | ,/. mouse radius | V vignette | B lineAA toggle | U lineAA mode | L analyticalAA | Q upscale mode | \\ interlaced mode | N edgeAA quality | Z generator scaling | K adaptive toggle | 0 adaptive on | F6 auto-tune | F7 toggle cache mode | R rebake | F11 cycle ram budget | F12 toggle interpolation | F8 overlay | F9 report | F10 parallel | I/O tiles/frame")
 	end
 	-- J = print schema/template helpers for customization
 	if k == "J" then
